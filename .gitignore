@@ -31,3 +31,6 @@ Icon
 # Temporary / Log files
 *.log
 *.tmp
+
+# Release packages
+dist/
