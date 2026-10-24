@@ -1,0 +1,33 @@
+# Build directories
+build/
+build-*/
+cmake-build-*/
+out/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+
+# Xcode / IDEs
+.idea/
+.vscode/
+*.xcodeproj/
+*.xcworkspace/
+*.swp
+*.swo
+
+# Compiled binaries
+*.o
+*.a
+*.dylib
+*.so
+*.vst3
+*.component
+*.app
+
+# Temporary / Log files
+*.log
+*.tmp
