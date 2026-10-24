@@ -8,7 +8,7 @@
 - macOS Universal Binary（Apple Silicon と Intel）に対応しています。Cubase 13 での使用を想定しています。
 - 開発中の旧版 V2 とは別のプラグインとして登録されます（プラグインコード `Fdb3`）。
 
-検出方式、旧版からの改善と測定結果（合成信号で誤検出 486 → 12 回/分、速く大きくなるハウリングの検出 324 → 221 ms、解析の CPU 負荷 −71 %）は [docs/v3-design-ja.md](docs/v3-design-ja.md) を参照してください。
+検出方式等の詳細は [docs/v3-design-ja.md](docs/v3-design-ja.md) を参照してください。
 
 ---
 
