@@ -8,7 +8,7 @@
 > - 遅延の報告と、状態の保存・復元を修正しました。
 > - 解析の CPU 負荷を 24〜86 % 減らしました。
 >
-> プラグイン名は「Feedback Suppressor V2.1」（コード `Fd21`）で、V2・V3 と同時にインストールできます。
+> プラグイン名は「Feedback Suppressor V2.1」（コード `Fd21`）で、V2 などの他の版と同時にインストールできます。
 > 詳しくは [docs/v2.1-notes-ja.md](docs/v2.1-notes-ja.md) を参照してください。
 > 以下の機能説明は V2 と共通です。
 
@@ -124,4 +124,4 @@ Windows（Visual Studio 2022 の C++、CMake、Inno Setup 6）: PowerShell で `
 
 AGPL-3.0-only（[LICENSE](LICENSE)）。JUCE 8.0.6 を AGPLv3 の下で使用しています（[licenses/JUCE.md](licenses/JUCE.md)、[THIRD_PARTY.md](THIRD_PARTY.md)）。
 
-改良版の V3 は同じリポジトリの main ブランチ（Release v3.0.0）にあります。
+検出方式を変更した実験版 V3 のソースは、タグ `v3.0.0` に残してあります（配布は終了しています）。
