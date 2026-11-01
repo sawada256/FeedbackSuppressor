@@ -167,6 +167,13 @@ target_link_libraries(processor_test PRIVATE juce::juce_audio_utils juce::juce_a
     juce::juce_gui_basics juce::juce_gui_extra juce::juce_recommended_config_flags)
 
 enable_testing()
+if(MSVC)
+    # FeedbackDetector is ~680 KB and the tests keep detectors as locals; Windows'
+    # default 1 MB stack is too small (the plug-in holds it inside the processor).
+    foreach(test_target dsp_test sine_sim_test music_detection_test v21_test processor_test)
+        target_link_options(${test_target} PRIVATE /STACK:16777216)
+    endforeach()
+endif()
 add_test(NAME legacy_dsp COMMAND dsp_test)
 add_test(NAME music_detection COMMAND music_detection_test)
 add_test(NAME v21_regression COMMAND v21_test)
