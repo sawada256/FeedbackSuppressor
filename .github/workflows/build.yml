@@ -50,8 +50,8 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-      - name: Publish release (V2.1 line, not marked latest)
+      - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --latest=false --title "Feedback Suppressor V2.1 ($GITHUB_REF_NAME)" --notes "V2.1: V2 detection results unchanged (verified bit-identical on synthetic tests) with real-time-safety, click and state fixes and lighter analysis. macOS universal ZIP (VST3/AU/Standalone) and Windows x64 installer/ZIP (VST3/Standalone). See README for installation. The improved V3 is release v3.0.0."
+          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "Feedback Suppressor V2.1 ($GITHUB_REF_NAME)" --notes "V2.1: V2 detection results unchanged (verified bit-identical on synthetic tests) with real-time-safety, click and state fixes and lighter analysis. macOS universal ZIP (VST3/AU/Standalone) and Windows x64 installer/ZIP (VST3/Standalone). See README for installation."
