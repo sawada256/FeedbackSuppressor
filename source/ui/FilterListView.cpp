@@ -173,12 +173,7 @@ void FilterListView::paintCell(juce::Graphics& g, int rowNumber, int columnId, i
             if (slot.isFixed || slot.isLocked)
             {
                 g.setColour(juce::Colour(0xffff9100));
-                g.drawText(slot.isLocked ? "LOCKED" : "FIXED", bounds, juce::Justification::centredLeft);
-            }
-            else if (slot.isReleasing)
-            {
-                g.setColour(juce::Colour(0xff7a889b));
-                g.drawText("releasing", bounds, juce::Justification::centredLeft);
+                g.drawText("LOCKED", bounds, juce::Justification::centredLeft);
             }
             else if (slot.liftDurationSec <= 0.0f)
             {

@@ -40,29 +40,14 @@ FeedbackSuppressorAudioProcessorEditor::FeedbackSuppressorAudioProcessorEditor(F
     };
 
     setupCombo(profileCombo, profileLabel, { "Speech", "Music", "Flat (1/f)", "High Focus", "Low Focus" });
-    setupCombo(detectionModeCombo, detectionModeLabel, { "Classic (Legacy)", "Advanced (Music Aware)", "Aggressive (Fast)" });
-    detectionModeCombo.setTooltip("Advanced (recommended): reacts to tones that grow on their own at a perfectly stable pitch and protects "
-                                  "harmonic notes, vibrato and pitch drift. Aggressive: lower thresholds and shorter confirmation, more "
-                                  "false cuts on music. Classic: the V1/V2 level-based detector (many false cuts on vocals).");
+    setupCombo(detectionModeCombo, detectionModeLabel, { "Standard (Safe)", "Advanced (Music Aware)", "Aggressive (Mix Hunter)" });
+    detectionModeCombo.setTooltip("Advanced: relative peaks, sustained frequency and harmonic protection. Aggressive: shorter confirmation for weak feedback. Pure sustained musical tones can still trigger.");
     setupCombo(growthSensCombo, growthSensLabel, { "Low", "Medium", "High" });
     setupCombo(liftTimeCombo, liftTimeLabel, { "5s", "15s", "30s", "60s", "5m", "Hold / Off" });
     setupCombo(opModeCombo, opModeLabel, { "Live Auto", "Learn (Soundcheck)", "Bypass" });
-    setupCombo(latencyModeCombo, latencyModeLabel, { "Zero Latency (0 ms)", "Lookahead Limiter (3 ms)" });
-    latencyModeCombo.setTooltip("Zero Latency: no delay at all. Lookahead Limiter: delays the output by 3 ms so the panic limiter "
-                                "catches sudden peaks without overshoot (latency is reported to the host).");
-    opModeCombo.setTooltip("Live Auto: temporary notches that lift after the Lift Timer. Learn (Soundcheck): new notches become Fixed "
-                           "and are saved with the project. Bypass: all notches fade out (detection pauses).");
-    profileCombo.setTooltip("Classic detector reference curve. In Advanced/Aggressive, High/Low Focus lower the threshold by 2 dB "
-                            "above 2 kHz / below 1.2 kHz.");
-    growthSensCombo.setTooltip("How fast a tone must grow to be treated as building feedback (Medium: 25 dB/s fast path, 6 dB/s slow path).");
-    liftTimeCombo.setTooltip("How long a Live notch stays before it is released (+4 dB/s). If the feedback returns, the notch "
-                             "comes back deeper. Hold keeps Live notches until cleared.");
-    sensitivitySlider.setTooltip("Detection threshold offset. Higher = catches weaker feedback earlier but cuts more often.");
-    notchQSlider.setTooltip("Notch width for new notches (35 = about 1/24 octave). Low-frequency notches are never narrower than 4 Hz.");
-    maxCutSlider.setTooltip("Deepest cut a single notch may reach. Notches start at 3-12 dB and deepen in 3 dB steps only while feedback remains.");
+    setupCombo(latencyModeCombo, latencyModeLabel, { "Zero Latency (0ms)", "Lookahead (3ms)" });
 
     panicLimiterButton.setToggleState(true, juce::dontSendNotification);
-    panicLimiterButton.setTooltip("Emergency limiter at -0.5 dBFS that protects ears and speakers while a notch is being placed.");
     addAndMakeVisible(panicLimiterButton);
 
     addAndMakeVisible(panicBadge);
@@ -123,11 +108,11 @@ void FeedbackSuppressorAudioProcessorEditor::paint(juce::Graphics& g)
     // Title
     g.setFont(juce::FontOptions(18.0f).withStyle("Bold"));
     g.setColour(juce::Colour(0xff00e5ff));
-    g.drawText("FEEDBACK SUPPRESSOR V3", 20, 10, 280, 20, juce::Justification::centredLeft);
+    g.drawText("FEEDBACK SUPPRESSOR V2.1", 20, 10, 280, 20, juce::Justification::centredLeft);
 
     g.setFont(juce::FontOptions(10.0f));
     g.setColour(juce::Colour(0xff64748b));
-    g.drawText("LIVE ACOUSTIC DEFENDER • ZERO LATENCY IIR • v" JucePlugin_VersionString, 20, 30, 360, 16, juce::Justification::centredLeft);
+    g.drawText("PRO LIVE ACOUSTIC DEFENDER • ZERO LATENCY IIR", 20, 30, 300, 16, juce::Justification::centredLeft);
 
     // Section outline for controls
     auto bounds = getLocalBounds();

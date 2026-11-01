@@ -24,7 +24,6 @@ private:
     FeedbackSuppressorAudioProcessor& processorRef;
 
     ModernLookAndFeel modernLnf;
-    juce::TooltipWindow tooltipWindow { this, 600 };
 
     // Components
     SpectrumVisualizer spectrumVisualizer;

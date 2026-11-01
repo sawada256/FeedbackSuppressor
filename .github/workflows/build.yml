@@ -2,7 +2,7 @@ name: build
 
 on:
   push:
-    branches: [main]
+    branches: [main, v2.1]
     tags: ['v*']
   pull_request:
 
@@ -22,10 +22,36 @@ jobs:
         run: ./scripts/package-macos.sh
       - uses: actions/upload-artifact@v4
         with:
-          name: FeedbackSuppressorV3-macOS-universal
+          name: macos
           path: dist/*.zip
-      - name: Publish release (tags only)
-        if: startsWith(github.ref, 'refs/tags/v')
+
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build, test, validate and package (x64 VST3 + installer)
+        shell: pwsh
+        env:
+          FS_PLUGINVAL: '1'
+        run: ./scripts/package-windows.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            dist/*.zip
+            dist/*.exe
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [macos, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish release (V2.1 line, not marked latest)
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/*.zip --title "Feedback Suppressor $GITHUB_REF_NAME" --notes "See README for installation (including the quarantine step)."
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --latest=false --title "Feedback Suppressor V2.1 ($GITHUB_REF_NAME)" --notes "V2.1: V2 detection results unchanged (verified bit-identical on synthetic tests) with real-time-safety, click and state fixes and lighter analysis. macOS universal ZIP (VST3/AU/Standalone) and Windows x64 installer/ZIP (VST3/Standalone). See README for installation. The improved V3 is release v3.0.0."

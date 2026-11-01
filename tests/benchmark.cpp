@@ -24,6 +24,10 @@ using namespace LiveAudioLab;
 
 namespace
 {
+// Equivalence dump (FS_DUMP=<file>): every detection event and notch state is
+// written so two builds can be diffed.
+FILE* dumpFile = nullptr;
+std::string dumpLabel;
 constexpr double twoPi = 6.283185307179586;
 
 // ---------------------------------------------------------------------------
@@ -123,7 +127,12 @@ std::vector<Event> runDetector(double sr, DetectionMode mode, DetectionProfile p
         detector.processNextFrames(list);
         cpu += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         for (const auto& e : list)
+        {
             events.push_back({ (start + blockSize) / sr, e.frequency });
+            if (dumpFile)
+                std::fprintf(dumpFile, "%s blk=%d f=%.4f peak=%.3f prom=%.3f cut=%.3f conf=%.4f\n", dumpLabel.c_str(),
+                             start / blockSize, e.frequency, e.peakDb, e.prominenceDb, e.suggestedCutDb, e.confidence);
+        }
     }
     if (cpuSeconds) *cpuSeconds = cpu;
     return events;
@@ -175,6 +184,7 @@ void benchDetectionTime(DetectionMode mode, double& meanMs, double& maxMs, int& 
                 l = s; r = s;
             };
             const double dur = onset + 60.0 / rate + 2.0;
+            dumpLabel = std::string("buildup ") + modeName(mode) + " rate=" + std::to_string(rate) + " f=" + std::to_string(target);
             const auto events = runDetector(sr, mode, DetectionProfile::Speech, dur, gen);
             double first = -1; float firstErr = 0;
             for (const auto& e : events)
@@ -207,6 +217,7 @@ std::vector<FpResult> benchFalsePositives(DetectionMode mode, DetectionProfile p
     auto measure = [&](const std::string& name, const Generator& gen)
     {
         if (const char* only = std::getenv("FS_ONLY"); only != nullptr && name != only) return;
+        dumpLabel = std::string("fp ") + modeName(mode) + " " + name;
         const auto events = runDetector(sr, mode, profile, dur, gen);
         out.push_back({ name, events.size() * 60.0 / dur });
     };
@@ -284,6 +295,7 @@ void benchFrequencyError(DetectionMode mode, double& meanHz, double& maxHz, doub
             ph += twoPi * f / sr;
             const double level = std::min(0.05, 0.002 * std::pow(10.0, 1.0 * t)); // +20 dB/s build-up
             l = r = static_cast<float>(level * std::sin(ph)) + noise(rng); };
+        dumpLabel = std::string("freq ") + modeName(mode) + " i=" + std::to_string(i);
         const auto events = runDetector(sr, mode, DetectionProfile::Flat1OverF, 3.0, gen);
         bool any = false;
         for (const auto& e : events)
@@ -335,11 +347,88 @@ void benchCpu(DetectionMode mode, double& detectorMsPerSec, double& filterMsPerS
     }
     filterMsPerSec = fcpu * 1000.0 / dur;
 }
+// Closed loop with the notch bank in the path (singer + 2 resonant feedback
+// modes, loop gain > 1). Logs notch states every 8 blocks and output RMS.
+void closedLoopNotchLog(DetectionMode mode, double& lastSecondRmsDb, unsigned seed = 31, int* notchCount = nullptr)
+{
+    const double sr = 48000;
+    const int blockSize = 256;
+    FeedbackDetector detector; detector.prepare(sr);
+    detector.setDetectionMode(mode);
+    detector.setProfile(DetectionProfile::Speech);
+    FilterManager manager; manager.prepare(sr); manager.setDefaultQ(35); manager.setLiftDuration(5.0f);
+    Voice voice(sr, seed);
+    Melody m { { 196.0, 220.0, 246.9, 261.6, 293.7 }, 0.9, 5.5, 35.0, 0.25 };
+    struct Res { double b0, b2, a1, a2, s1 = 0, s2 = 0; };
+    std::vector<Res> modes;
+    for (double f : { 1873.0, 3120.0 })
+    {
+        const double w = twoPi * f / sr, alpha = std::sin(w) / (2.0 * 40.0);
+        modes.push_back({ alpha / (1 + alpha), -alpha / (1 + alpha), -2 * std::cos(w) / (1 + alpha), (1 - alpha) / (1 + alpha) });
+    }
+    std::vector<float> fb(blockSize, 0.0f);
+    double power = 0; int count = 0;
+    const int blocks = static_cast<int>(12.0 * sr / blockSize);
+    for (int b = 0; b < blocks; ++b)
+    {
+        juce::AudioBuffer<float> block(2, blockSize);
+        for (int i = 0; i < blockSize; ++i)
+        {
+            const double t = (b * blockSize + i) / sr;
+            double nt; const double f0 = m.f0At(t, nt);
+            const double gain = t < 6.0 ? 1.06 : 0.6; // loop unstable for 6 s, then the mic moves away
+            const float s = static_cast<float>(std::tanh(0.1 * noteEnvelope(nt, m.noteSec) * voice.next(f0) + gain * fb[static_cast<size_t>(i)]));
+            block.setSample(0, i, s); block.setSample(1, i, s);
+        }
+        manager.processAudio(block);
+        for (int i = 0; i < blockSize; ++i)
+        {
+            const double x = block.getSample(0, i);
+            double y = 0;
+            for (auto& r : modes) { const double o = r.b0 * x + r.s1; r.s1 = -r.a1 * o + r.s2; r.s2 = r.b2 * x - r.a2 * o; y += 4.0 * o; }
+            fb[static_cast<size_t>(i)] = static_cast<float>(y);
+            if (b >= blocks - static_cast<int>(sr / blockSize)) { power += x * x; ++count; }
+        }
+        detector.pushSamples(block.getArrayOfReadPointers(), 2, blockSize);
+        std::vector<DetectedFeedback> events;
+        detector.processNextFrames(events);
+        manager.handleDetections(events);
+        manager.updateTimers(static_cast<float>(blockSize / sr));
+        if (dumpFile && b % 8 == 0)
+        {
+            std::fprintf(dumpFile, "loop %s blk=%d rms=%.2f", modeName(mode), b, 20.0 * std::log10(block.getRMSLevel(0, 0, blockSize) + 1e-9));
+            for (const auto& slot : manager.getFilterSnapshots())
+                std::fprintf(dumpFile, " [%.2fHz tgt=%.2f cur=%.2f q=%.1f]", slot.frequency, slot.targetGainDb, slot.currentGainDb, slot.q);
+            std::fprintf(dumpFile, "\n");
+        }
+    }
+    lastSecondRmsDb = 10.0 * std::log10(power / count + 1e-18);
+    if (notchCount) *notchCount = static_cast<int>(manager.getFilterSnapshots().size());
+}
 } // namespace
 
 int main(int argc, char** argv)
 {
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
+    if (const char* path = std::getenv("FS_DUMP")) dumpFile = std::fopen(path, "w");
+    if (const char* seeds = std::getenv("FS_LOOPSEEDS"))
+    {
+        // Closed-loop statistics over many voice seeds (the loop is chaotic, so
+        // single runs are compared as distributions).
+        for (auto mode : { DetectionMode::Advanced, DetectionMode::Aggressive, DetectionMode::Standard })
+        {
+            double sum = 0; int notches = 0; const int n = std::atoi(seeds);
+            for (int seed = 1; seed <= n; ++seed)
+            {
+                double db; int c;
+                closedLoopNotchLog(mode, db, static_cast<unsigned>(seed), &c);
+                std::printf("loopseed %s seed=%d lastSecondRms=%.2f dB notches=%d\n", modeName(mode), seed, db, c);
+                sum += db; notches += c;
+            }
+            std::printf("loopseed %s MEAN lastSecondRms=%.2f dB notches=%.2f\n", modeName(mode), sum / n, static_cast<double>(notches) / n);
+        }
+        return 0;
+    }
     const bool quick = argc > 1 && std::strcmp(argv[1], "--quick") == 0;
     std::printf("== Feedback Suppressor benchmark ==\n");
     for (auto mode : { DetectionMode::Advanced, DetectionMode::Aggressive, DetectionMode::Standard })
@@ -365,6 +454,10 @@ int main(int argc, char** argv)
         double dMs, fMs;
         benchCpu(mode, dMs, fMs);
         std::printf("[%s] CPU per audio second: detector=%.2f ms, 12-notch stereo cascade=%.2f ms\n", modeName(mode), dMs, fMs);
+        double loopDb;
+        closedLoopNotchLog(mode, loopDb);
+        std::printf("[%s] closed loop (2 modes, gain 1.06 -> 0.6): output RMS in the last second %.2f dB\n", modeName(mode), loopDb);
     }
+    if (dumpFile) std::fclose(dumpFile);
     return 0;
 }

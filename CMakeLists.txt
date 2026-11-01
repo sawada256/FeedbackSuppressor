@@ -1,8 +1,11 @@
 cmake_minimum_required(VERSION 3.20)
-project(FeedbackSuppressor VERSION 3.0.0 LANGUAGES C CXX)
+project(FeedbackSuppressor VERSION 2.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+# Windows: link the C++ runtime statically so the plug-in loads without the
+# Visual C++ Redistributable being installed.
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 # macOS Universal Binary support (Intel x86_64 & Apple Silicon arm64)
 if(APPLE)
@@ -25,7 +28,7 @@ FetchContent_MakeAvailable(juce)
 # Define the Audio Plugin Target
 juce_add_plugin(FeedbackSuppressor
     COMPANY_NAME "LiveAudioLab"
-    BUNDLE_ID "io.github.sawada256.feedbacksuppressorv3"
+    BUNDLE_ID "io.github.sawada256.feedbacksuppressorv21"
     IS_SYNTH FALSE
     NEEDS_MIDI_INPUT FALSE
     NEEDS_MIDI_OUTPUT FALSE
@@ -33,14 +36,14 @@ juce_add_plugin(FeedbackSuppressor
     EDITOR_WANTS_KEYBOARD_FOCUS TRUE
     COPY_PLUGIN_AFTER_BUILD FALSE
     PLUGIN_MANUFACTURER_CODE LALb
-    PLUGIN_CODE Fdb3
+    PLUGIN_CODE Fd21
     FORMATS VST3 AU Standalone
-    PRODUCT_NAME "Feedback Suppressor V3"
+    PRODUCT_NAME "Feedback Suppressor V2.1"
 )
 
-# The linker ad-hoc signs the binary, but JUCE adds Contents/Resources/moduleinfo.json
-# afterwards, which invalidates the bundle seal. Re-sign the finished VST3 bundle
-# (ad-hoc) so `codesign --verify --deep --strict` passes and hosts load it cleanly.
+# The linker ad-hoc signs the binaries, but JUCE writes Contents/Resources/moduleinfo.json
+# into the VST3 afterwards, which breaks the bundle seal. Re-sign every finished bundle
+# ad-hoc so `codesign --verify --deep --strict` passes.
 if(APPLE)
     foreach(format_target FeedbackSuppressor_VST3 FeedbackSuppressor_AU FeedbackSuppressor_Standalone)
         if(TARGET ${format_target})
@@ -64,6 +67,7 @@ target_sources(FeedbackSuppressor PRIVATE
     source/dsp/FilterManager.h
     source/dsp/FilterManager.cpp
     source/dsp/PanicLimiter.h
+    source/dsp/LookaheadDelay.h
     source/ui/SpectrumVisualizer.h
     source/ui/SpectrumVisualizer.cpp
     source/ui/FilterListView.h
@@ -140,9 +144,9 @@ add_executable(music_detection_test
 )
 target_include_directories(music_detection_test PRIVATE source source/dsp)
 target_link_libraries(music_detection_test PRIVATE juce::juce_audio_basics juce::juce_dsp juce::juce_core)
-add_executable(v3_test tests/v3_test.cpp source/dsp/FeedbackDetector.cpp source/dsp/FilterManager.cpp)
-target_include_directories(v3_test PRIVATE source source/dsp)
-target_link_libraries(v3_test PRIVATE juce::juce_audio_basics juce::juce_dsp juce::juce_core)
+add_executable(v21_test tests/v21_test.cpp source/dsp/FeedbackDetector.cpp source/dsp/FilterManager.cpp)
+target_include_directories(v21_test PRIVATE source source/dsp)
+target_link_libraries(v21_test PRIVATE juce::juce_audio_basics juce::juce_dsp juce::juce_core)
 
 # Processor-level smoke test (threads, state, latency, editor) as a console app
 add_executable(processor_test
@@ -156,19 +160,26 @@ add_executable(processor_test
     source/ui/CustomControls.cpp)
 target_include_directories(processor_test PRIVATE source source/dsp source/ui)
 target_compile_definitions(processor_test PRIVATE
-    JucePlugin_Name="Feedback Suppressor V3"
+    JucePlugin_Name="Feedback Suppressor V2.1"
     JucePlugin_VersionString="${PROJECT_VERSION}"
     JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 JUCE_MODAL_LOOPS_PERMITTED=1)
 target_link_libraries(processor_test PRIVATE juce::juce_audio_utils juce::juce_audio_processors juce::juce_dsp
     juce::juce_gui_basics juce::juce_gui_extra juce::juce_recommended_config_flags)
 
 enable_testing()
+if(MSVC)
+    # FeedbackDetector is ~680 KB and the tests keep detectors as locals; Windows'
+    # default 1 MB stack is too small (the plug-in holds it inside the processor).
+    foreach(test_target dsp_test sine_sim_test music_detection_test v21_test processor_test)
+        target_link_options(${test_target} PRIVATE /STACK:16777216)
+    endforeach()
+endif()
 add_test(NAME legacy_dsp COMMAND dsp_test)
 add_test(NAME music_detection COMMAND music_detection_test)
-add_test(NAME v3_regression COMMAND v3_test)
+add_test(NAME v21_regression COMMAND v21_test)
 add_test(NAME processor_smoke COMMAND processor_test)
 
-# Metrics benchmark (detection time, false positives, frequency error, CPU)
+# Metrics / equivalence benchmark (FS_DUMP=<file> writes every event and notch state)
 add_executable(fs_benchmark tests/benchmark.cpp source/dsp/FeedbackDetector.cpp source/dsp/FilterManager.cpp)
 target_include_directories(fs_benchmark PRIVATE source source/dsp)
 target_link_libraries(fs_benchmark PRIVATE juce::juce_audio_basics juce::juce_dsp juce::juce_core)
