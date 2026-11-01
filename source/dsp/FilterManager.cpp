@@ -9,19 +9,9 @@ FilterManager::FilterManager()
 {
     for (int i = 0; i < TOTAL_FILTERS; ++i)
     {
-        slots[static_cast<size_t>(i)].id = -1; // inactive
-        slots[static_cast<size_t>(i)].isFixed = (i >= MAX_LIVE_FILTERS);
-        sharedCurrentGainDb[static_cast<size_t>(i)].store(0.0f, std::memory_order_relaxed);
+        slots[i].id = -1; // inactive
+        slots[i].isFixed = (i >= MAX_LIVE_FILTERS);
     }
-}
-
-float FilterManager::effectiveQ(float q, float freqHz) noexcept
-{
-    // Constant-Q notches become extremely narrow at low frequencies (Q 35 at
-    // 100 Hz is 2.9 Hz wide), smaller than the detector's frequency error and
-    // the drift of a room mode. Commercial units widen low notches (e.g. dbx
-    // AFS2 uses a fixed 8 Hz width below ~930 Hz in its music setting).
-    return juce::jlimit(1.0f, 150.0f, juce::jmin(q, freqHz / MIN_BANDWIDTH_HZ));
 }
 
 void FilterManager::prepare(double newSampleRate)
@@ -29,15 +19,20 @@ void FilterManager::prepare(double newSampleRate)
     std::lock_guard<std::mutex> lock(filterMutex);
     sampleRate = newSampleRate > 0.0 ? newSampleRate : 44100.0;
 
+    // Audio is stopped here, so the audio-thread filters may be set directly.
     for (int i = 0; i < TOTAL_FILTERS; ++i)
     {
         const auto si = static_cast<size_t>(i);
+        auto& sh = shadow[si];
+        if (slots[si].id != -1)
+            sh = { slots[si].frequency, slots[si].targetGainDb, slots[si].q, slots[si].isBypassed, sh.immediateGeneration };
+        else
+            sh = { 1000.0f, 0.0f, defaultQ, true, sh.immediateGeneration };
         dspFilters[si].prepare(sampleRate);
-        const auto& slot = slots[si];
-        const bool active = slot.id != -1 && ! slot.isBypassed;
-        dspFilters[si].setTarget(slot.frequency, active ? slot.targetGainDb : 0.0f, slot.q);
-        dspFilters[si].snapToTarget();
-        lastEnabled[si] = active;
+        dspFilters[si].setBypass(sh.bypass);
+        dspFilters[si].setParameters(sh.freq, sh.gainDb, sh.q, true);
+        appliedImmediateGeneration[si] = sh.immediateGeneration;
+        sharedCurrentGainDb[si].store(dspFilters[si].getCurrentGainDb(), std::memory_order_relaxed);
         publish(i);
     }
 }
@@ -45,56 +40,78 @@ void FilterManager::prepare(double newSampleRate)
 void FilterManager::reset()
 {
     std::lock_guard<std::mutex> lock(filterMutex);
-    for (auto& f : dspFilters)
-        f.reset();
+    for (int i = 0; i < TOTAL_FILTERS; ++i)
+    {
+        dspFilters[i].reset();
+    }
+}
+
+void FilterManager::ctlSetParameters(int index, float freqHz, float gainDb, float q, bool immediate) noexcept
+{
+    auto& sh = shadow[static_cast<size_t>(index)];
+    sh.freq = freqHz; sh.gainDb = gainDb; sh.q = q;
+    if (immediate) ++sh.immediateGeneration;
+    publish(index);
+}
+
+void FilterManager::ctlSetBypass(int index, bool bypass) noexcept
+{
+    shadow[static_cast<size_t>(index)].bypass = bypass;
+    publish(index);
 }
 
 void FilterManager::publish(int index) noexcept
 {
-    // Single writer (callers hold filterMutex). Seqlock: odd = write in progress.
+    // Single writer (callers hold filterMutex). Odd sequence = write in progress.
     auto& box = mailbox[static_cast<size_t>(index)];
-    const auto& slot = slots[static_cast<size_t>(index)];
+    const auto& sh = shadow[static_cast<size_t>(index)];
     const uint32_t seq = box.sequence.load(std::memory_order_relaxed);
     box.sequence.store(seq + 1, std::memory_order_relaxed);
     std::atomic_thread_fence(std::memory_order_release);
-    box.freq.store(slot.frequency, std::memory_order_relaxed);
-    box.gainDb.store(slot.targetGainDb, std::memory_order_relaxed);
-    box.q.store(slot.q, std::memory_order_relaxed);
-    box.enabled.store(slot.id != -1 && ! slot.isBypassed, std::memory_order_relaxed);
+    box.freq.store(sh.freq, std::memory_order_relaxed);
+    box.gainDb.store(sh.gainDb, std::memory_order_relaxed);
+    box.q.store(sh.q, std::memory_order_relaxed);
+    box.bypass.store(sh.bypass, std::memory_order_relaxed);
+    box.immediateGeneration.store(sh.immediateGeneration, std::memory_order_relaxed);
     box.sequence.store(seq + 2, std::memory_order_release);
 }
 
 void FilterManager::processAudio(juce::AudioBuffer<float>& buffer) noexcept
 {
+    // V2 returned immediately in Bypass mode, removing every notch at once
+    // (click). V2.1 fades all notches out and back in with the normal smoothing.
     const bool bypassAll = currentMode.load(std::memory_order_relaxed) == OperationMode::Bypass;
-    const int numChannels = juce::jmin(2, buffer.getNumChannels());
-    const int numSamples = buffer.getNumSamples();
-    if (numChannels <= 0 || numSamples <= 0)
-        return;
     auto* const* channels = buffer.getArrayOfWritePointers();
+    const int numChannels = buffer.getNumChannels();
+    const int numSamples = buffer.getNumSamples();
 
     for (int i = 0; i < TOTAL_FILTERS; ++i)
     {
         const auto si = static_cast<size_t>(i);
         auto& box = mailbox[si];
+        auto& filter = dspFilters[si];
         const uint32_t seq1 = box.sequence.load(std::memory_order_acquire);
         if ((seq1 & 1u) == 0u)
         {
             const float f = box.freq.load(std::memory_order_relaxed);
             const float g = box.gainDb.load(std::memory_order_relaxed);
             const float q = box.q.load(std::memory_order_relaxed);
-            const bool en = box.enabled.load(std::memory_order_relaxed);
+            const bool bypass = box.bypass.load(std::memory_order_relaxed);
+            const uint32_t gen = box.immediateGeneration.load(std::memory_order_relaxed);
             std::atomic_thread_fence(std::memory_order_acquire);
             if (box.sequence.load(std::memory_order_relaxed) == seq1)
             {
-                lastFreq[si] = f; lastGain[si] = g; lastQ[si] = q; lastEnabled[si] = en;
+                filter.setBypass(bypass || bypassAll);
+                const bool immediate = gen != appliedImmediateGeneration[si];
+                appliedImmediateGeneration[si] = gen;
+                filter.setParameters(f, g, q, immediate);
             }
         }
-        // Otherwise keep the previous consistent set for this block.
+        else
+        {
+            filter.setBypass(filter.isBypassed() || bypassAll); // keep last consistent targets
+        }
 
-        const bool active = lastEnabled[si] && ! bypassAll;
-        auto& filter = dspFilters[si];
-        filter.setTarget(lastFreq[si], active ? lastGain[si] : 0.0f, lastQ[si]);
         filter.process(channels, numChannels, numSamples);
         sharedCurrentGainDb[si].store(filter.getCurrentGainDb(), std::memory_order_relaxed);
     }
@@ -102,228 +119,208 @@ void FilterManager::processAudio(juce::AudioBuffer<float>& buffer) noexcept
 
 void FilterManager::handleDetections(const std::vector<DetectedFeedback>& detections)
 {
-    if (currentMode.load() == OperationMode::Bypass || detections.empty())
+    if (currentMode == OperationMode::Bypass || detections.empty())
         return;
 
     std::lock_guard<std::mutex> lock(filterMutex);
 
     for (const auto& df : detections)
     {
-        if (! std::isfinite(df.frequency) || ! std::isfinite(df.suggestedCutDb)
-            || df.frequency < 20.0f || df.frequency >= sampleRate * 0.49)
-            continue;
-        const int matchIdx = findMatchingFilterIndex(df.frequency);
+        if (!std::isfinite(df.frequency) || !std::isfinite(df.suggestedCutDb)
+            || df.frequency < 20.0f || df.frequency >= sampleRate * 0.49) continue;
+        int matchIdx = findMatchingFilterIndex(df.frequency);
 
         if (matchIdx >= 0)
         {
-            auto& slot = slots[static_cast<size_t>(matchIdx)];
+            // Existing filter found near this frequency!
+            auto& slot = slots[matchIdx];
             if (slot.isBypassed || slot.isLocked) continue;
             slot.activity = 1.0f;
             slot.triggerCount++;
 
-            // Residual feedback after the notch: deepen in 3 dB steps, rate limited.
+            // If feedback is continuing, deepen notch cut (up to maxCutDepthDb)
             if (slot.deepenCooldownSec <= 0.0f)
             {
-                const float base = slot.isReleasing ? juce::jmin(slot.targetGainDb, -3.0f) : slot.targetGainDb;
-                slot.targetGainDb = juce::jmax(maxCutDepthDb, base - 3.0f);
+                slot.targetGainDb = juce::jmax(maxCutDepthDb, slot.targetGainDb - 3.0f);
                 slot.deepenCooldownSec = 0.15f;
-                if (! slot.isFixed)
-                {
-                    // Track slow drift of the mode, but smoothly (half-way step).
-                    slot.frequency += 0.5f * (df.frequency - slot.frequency);
-                    slot.q = effectiveQ(defaultQ, slot.frequency);
-                }
+                if (!slot.isFixed) slot.frequency = df.frequency;
             }
-            slot.isReleasing = false;
-            if (! slot.isFixed)
-                slot.liftRemainingSec = slot.liftDurationSec;
 
-            publish(matchIdx);
+            // Reset lift timer
+            if (!slot.isFixed && !slot.isLocked)
+            {
+                slot.liftRemainingSec = liftDurationSec;
+            }
+
+            ctlSetParameters(matchIdx, slot.frequency, slot.targetGainDb, slot.q);
         }
         else
         {
-            const bool asFixed = (currentMode.load() == OperationMode::LearnSoundcheck);
-            const int slotIdx = asFixed ? allocateFixedSlot() : allocateLiveSlot();
-            if (slotIdx < 0) continue;
+            // New feedback point! Allocate appropriate slot
+            int slotIdx = -1;
+            bool asFixed = (currentMode == OperationMode::LearnSoundcheck);
 
-            auto& slot = slots[static_cast<size_t>(slotIdx)];
-            if (slot.id != -1 && ! slot.isFixed)
-                rememberNotch(slot); // stolen
-            const float recalled = recalledDepth(df.frequency);
-            float cut = juce::jlimit(3.0f, 12.0f, df.suggestedCutDb);
-            if (recalled > 0.0f) cut = juce::jmax(cut, recalled - 3.0f); // known trouble frequency: restart deeper
+            if (asFixed)
+            {
+                slotIdx = allocateFixedSlot();
+            }
+            else
+            {
+                slotIdx = allocateLiveSlot();
+            }
 
-            slot.id = nextId++;
-            slot.isFixed = asFixed;
-            slot.isLocked = false; // soundcheck filters can deepen until explicitly locked
-            slot.isBypassed = false;
-            slot.isReleasing = false;
-            slot.frequency = df.frequency;
-            slot.q = effectiveQ(defaultQ, df.frequency);
-            slot.targetGainDb = juce::jmax(maxCutDepthDb, -cut);
-            slot.deepenCooldownSec = 0.15f;
-            slot.currentGainDb = 0.0f;
-            slot.liftDurationSec = liftDurationSec;
-            slot.liftRemainingSec = liftDurationSec;
-            slot.triggerCount = 1;
-            slot.activity = 1.0f;
-            publish(slotIdx);
+            if (slotIdx >= 0)
+            {
+                auto& slot = slots[slotIdx];
+                slot.id = nextId++;
+                slot.isFixed = asFixed;
+                slot.isLocked = false; // fixed frequency can deepen until explicitly locked
+                slot.isBypassed = false;
+                slot.frequency = df.frequency;
+                slot.q = defaultQ;
+                slot.targetGainDb = juce::jmax(maxCutDepthDb, -juce::jlimit(3.0f, 12.0f, df.suggestedCutDb));
+                slot.deepenCooldownSec = 0.15f;
+                slot.currentGainDb = 0.0f;
+                slot.liftRemainingSec = liftDurationSec;
+                slot.liftDurationSec = liftDurationSec;
+                slot.triggerCount = 1;
+                slot.activity = 1.0f;
+
+                ctlSetBypass(slotIdx, false);
+                ctlSetParameters(slotIdx, slot.frequency, slot.targetGainDb, slot.q);
+            }
         }
     }
 }
 
 void FilterManager::updateTimers(float deltaTimeSec)
 {
-    if (! (deltaTimeSec > 0.0f)) return;
     std::lock_guard<std::mutex> lock(filterMutex);
-
-    for (auto& r : recentNotches)
-        r.ageSec += deltaTimeSec;
 
     for (int i = 0; i < TOTAL_FILTERS; ++i)
     {
-        auto& slot = slots[static_cast<size_t>(i)];
+        auto& slot = slots[i];
         if (slot.id == -1)
             continue;
 
         slot.deepenCooldownSec = juce::jmax(0.0f, slot.deepenCooldownSec - deltaTimeSec);
+
+        // Activity fade
         slot.activity = juce::jmax(0.0f, slot.activity - deltaTimeSec * 1.5f);
+
+        // Update current gain from DSP filter
         slot.currentGainDb = sharedCurrentGainDb[static_cast<size_t>(i)].load(std::memory_order_relaxed);
 
-        if (slot.isFixed || slot.isLocked || slot.liftDurationSec <= 0.0f)
-            continue;
-
-        if (slot.liftRemainingSec > 0.0f)
+        // Check if dynamic lift is enabled for Live filter
+        if (!slot.isFixed && !slot.isLocked && slot.liftDurationSec > 0.0f)
         {
-            slot.liftRemainingSec -= deltaTimeSec;
-            continue;
+            if (slot.liftRemainingSec > 0.0f)
+            {
+                slot.liftRemainingSec -= deltaTimeSec;
+            }
+            else
+            {
+                // Timer expired -> lift filter (ramp gain back to 0 dB)
+                slot.targetGainDb += 4.0f * deltaTimeSec; // +4 dB / sec recovery
+                if (slot.targetGainDb >= 0.0f)
+                {
+                    slot.targetGainDb = 0.0f;
+                    ctlSetParameters(i, slot.frequency, 0.0f, slot.q);
+                    if (std::abs(slot.currentGainDb) < 0.2f)
+                    {
+                        // Fully lifted: free the slot!
+                        slot.id = -1;
+                        ctlSetBypass(i, true); // V2.1: fade out at its own frequency instead of an instant jump
+                    }
+                }
+                else
+                {
+                    ctlSetParameters(i, slot.frequency, slot.targetGainDb, slot.q);
+                }
+            }
         }
-
-        // Timer expired: release the notch gradually (+4 dB/s). If feedback
-        // returns during the release the detector re-deepens it.
-        if (! slot.isReleasing)
-            rememberNotch(slot);
-        slot.isReleasing = true;
-        slot.targetGainDb = juce::jmin(0.0f, slot.targetGainDb + 4.0f * deltaTimeSec);
-        if (slot.targetGainDb >= 0.0f && std::abs(slot.currentGainDb) < 0.2f)
-            freeSlot(i);
-        else
-            publish(i);
     }
 }
 
-void FilterManager::rememberNotch(const FilterSlotInfo& slot)
-{
-    // Keep the deepest cut seen per frequency for 2 minutes.
-    const float depth = -juce::jmin(slot.targetGainDb, slot.currentGainDb);
-    if (depth < 3.0f) return;
-    RecentNotch* target = nullptr;
-    for (auto& r : recentNotches)
-        if (r.ageSec < 120.0f && std::abs(r.frequency - slot.frequency) <= juce::jmax(3.0f, 0.01f * slot.frequency))
-            target = &r;
-    if (target == nullptr)
-        target = &*std::max_element(recentNotches.begin(), recentNotches.end(),
-                                    [](const RecentNotch& a, const RecentNotch& b) { return a.ageSec < b.ageSec; });
-    target->frequency = slot.frequency;
-    target->depthDb = juce::jmax(depth, target->ageSec < 120.0f ? target->depthDb : 0.0f);
-    target->ageSec = 0.0f;
-}
-
-float FilterManager::recalledDepth(float freqHz) const
-{
-    for (const auto& r : recentNotches)
-        if (r.ageSec < 120.0f && std::abs(r.frequency - freqHz) <= juce::jmax(3.0f, 0.01f * freqHz))
-            return r.depthDb;
-    return 0.0f;
-}
-
-void FilterManager::freeSlot(int index) noexcept
-{
-    auto& slot = slots[static_cast<size_t>(index)];
-    slot.id = -1;
-    slot.isLocked = false;
-    slot.isBypassed = false;
-    slot.isReleasing = false;
-    slot.isFixed = index >= MAX_LIVE_FILTERS;
-    slot.targetGainDb = 0.0f;
-    publish(index); // audio thread ramps the gain to 0 dB, then idles
-}
-
-int FilterManager::findMatchingFilterIndex(float freqHz, float tolerancePercent) const
+int FilterManager::findMatchingFilterIndex(float freqHz, float tolerancePercent)
 {
     float minDiff = 1e9f;
     int bestIdx = -1;
 
     for (int i = 0; i < TOTAL_FILTERS; ++i)
     {
-        const auto& slot = slots[static_cast<size_t>(i)];
-        if (slot.id == -1) continue;
-        const float absDiff = std::abs(slot.frequency - freqHz);
-        const float percentDiff = absDiff / freqHz * 100.0f;
-        const float bandwidthTolerance = juce::jmax(2.0f, 0.5f * slot.frequency / slot.q);
-        if (percentDiff <= tolerancePercent && absDiff <= bandwidthTolerance && percentDiff < minDiff)
+        if (slots[i].id != -1)
         {
-            minDiff = percentDiff;
-            bestIdx = i;
+            float percentDiff = std::abs(slots[i].frequency - freqHz) / freqHz * 100.0f;
+            const float bandwidthTolerance = juce::jmax(2.0f, 0.5f * slots[i].frequency / slots[i].q);
+            if (percentDiff <= tolerancePercent && std::abs(slots[i].frequency - freqHz) <= bandwidthTolerance
+                && percentDiff < minDiff)
+            {
+                minDiff = percentDiff;
+                bestIdx = i;
+            }
         }
     }
     return bestIdx;
 }
 
-int FilterManager::allocateLiveSlot() const
+int FilterManager::allocateLiveSlot()
 {
-    // 1. Prefer a free slot whose biquad has already faded out.
-    int freeButFading = -1;
+    // 1. Look for inactive Live slot
     for (int i = 0; i < MAX_LIVE_FILTERS; ++i)
     {
-        if (slots[static_cast<size_t>(i)].id != -1) continue;
-        if (std::abs(sharedCurrentGainDb[static_cast<size_t>(i)].load(std::memory_order_relaxed)) < 0.05f)
+        if (slots[i].id == -1)
             return i;
-        if (freeButFading < 0) freeButFading = i;
     }
-    if (freeButFading >= 0) return freeButFading;
 
-    // 2. All occupied: steal the unlocked live notch that matters least —
-    // one already releasing, otherwise the shallowest, then the oldest timer.
+    // 2. All occupied: steal the one closest to lifting or with lowest cut
     int stealIdx = -1;
-    float bestScore = 1e9f;
+    float lowestLift = 1e9f;
     for (int i = 0; i < MAX_LIVE_FILTERS; ++i)
     {
-        const auto& slot = slots[static_cast<size_t>(i)];
-        if (slot.isLocked || slot.isFixed) continue;
-        const float score = (slot.isReleasing ? -100.0f : 0.0f) - slot.targetGainDb * 10.0f
-                          + juce::jmax(0.0f, slot.liftRemainingSec) * 0.01f;
-        if (score < bestScore) { bestScore = score; stealIdx = i; }
+        if (!slots[i].isLocked && slots[i].liftRemainingSec < lowestLift)
+        {
+            lowestLift = slots[i].liftRemainingSec;
+            stealIdx = i;
+        }
     }
     return stealIdx;
 }
 
-int FilterManager::allocateFixedSlot() const
+int FilterManager::allocateFixedSlot()
 {
+    // 1. Look for inactive Fixed slot
     for (int i = MAX_LIVE_FILTERS; i < TOTAL_FILTERS; ++i)
-        if (slots[static_cast<size_t>(i)].id == -1)
+    {
+        if (slots[i].id == -1)
             return i;
-    return -1; // Soundcheck filters are retained until explicitly cleared.
+    }
+
+    // Soundcheck filters are retained until explicitly cleared.
+    return -1;
 }
 
 void FilterManager::setOperationMode(OperationMode mode)
 {
-    currentMode.store(mode);
+    currentMode = mode;
 }
 
 void FilterManager::setDefaultQ(float q)
 {
     std::lock_guard<std::mutex> lock(filterMutex);
-    const float newQ = juce::jlimit(5.0f, 120.0f, q);
-    if (std::abs(newQ - defaultQ) <= 0.05f) return;
-    defaultQ = newQ;
-    for (int i = 0; i < TOTAL_FILTERS; ++i)
+    float newQ = juce::jlimit(5.0f, 120.0f, q);
+    if (std::abs(newQ - defaultQ) > 0.05f)
     {
-        auto& slot = slots[static_cast<size_t>(i)];
-        if (slot.id != -1 && ! slot.isLocked)
+        defaultQ = newQ;
+        for (int i = 0; i < TOTAL_FILTERS; ++i)
         {
-            slot.q = effectiveQ(defaultQ, slot.frequency);
-            publish(i);
+            if (slots[static_cast<size_t>(i)].id != -1 && !slots[static_cast<size_t>(i)].isLocked)
+            {
+                slots[static_cast<size_t>(i)].q = defaultQ;
+                ctlSetParameters(i, slots[static_cast<size_t>(i)].frequency,
+                                                                 slots[static_cast<size_t>(i)].targetGainDb,
+                                                                 slots[static_cast<size_t>(i)].q);
+            }
         }
     }
 }
@@ -331,16 +328,22 @@ void FilterManager::setDefaultQ(float q)
 void FilterManager::setMaxCutDepth(float depthDb)
 {
     std::lock_guard<std::mutex> lock(filterMutex);
-    const float newDepth = juce::jlimit(-40.0f, -6.0f, depthDb);
-    if (std::abs(newDepth - maxCutDepthDb) <= 0.05f) return;
-    maxCutDepthDb = newDepth;
-    for (int i = 0; i < TOTAL_FILTERS; ++i)
+    float newDepth = juce::jlimit(-40.0f, -6.0f, depthDb);
+    if (std::abs(newDepth - maxCutDepthDb) > 0.05f)
     {
-        auto& slot = slots[static_cast<size_t>(i)];
-        if (slot.id != -1 && ! slot.isLocked && slot.targetGainDb < maxCutDepthDb)
+        maxCutDepthDb = newDepth;
+        for (int i = 0; i < TOTAL_FILTERS; ++i)
         {
-            slot.targetGainDb = maxCutDepthDb;
-            publish(i);
+            if (slots[static_cast<size_t>(i)].id != -1 && !slots[static_cast<size_t>(i)].isLocked)
+            {
+                if (slots[static_cast<size_t>(i)].targetGainDb < maxCutDepthDb)
+                {
+                    slots[static_cast<size_t>(i)].targetGainDb = maxCutDepthDb;
+                    ctlSetParameters(i, slots[static_cast<size_t>(i)].frequency,
+                                                                     slots[static_cast<size_t>(i)].targetGainDb,
+                                                                     slots[static_cast<size_t>(i)].q);
+                }
+            }
         }
     }
 }
@@ -351,7 +354,7 @@ void FilterManager::setLiftDuration(float seconds)
     if (liftDurationSec == seconds) return;
     liftDurationSec = seconds;
     for (auto& slot : slots)
-        if (slot.id != -1 && ! slot.isFixed && ! slot.isLocked)
+        if (slot.id != -1 && !slot.isFixed && !slot.isLocked)
         {
             slot.liftDurationSec = seconds;
             slot.liftRemainingSec = seconds;
@@ -363,9 +366,11 @@ void FilterManager::clearAllLive()
     std::lock_guard<std::mutex> lock(filterMutex);
     for (int i = 0; i < MAX_LIVE_FILTERS; ++i)
     {
-        const auto& slot = slots[static_cast<size_t>(i)];
-        if (slot.id != -1 && ! slot.isLocked && ! slot.isFixed)
-            freeSlot(i);
+        if (!slots[i].isLocked)
+        {
+            slots[i].id = -1;
+            ctlSetBypass(i, true); // V2.1: fade out at its own frequency instead of an instant jump
+        }
     }
 }
 
@@ -374,18 +379,10 @@ void FilterManager::lockAllLiveToFixed()
     std::lock_guard<std::mutex> lock(filterMutex);
     for (int i = 0; i < MAX_LIVE_FILTERS; ++i)
     {
-        auto& slot = slots[static_cast<size_t>(i)];
-        if (slot.id != -1)
+        if (slots[i].id != -1)
         {
-            slot.isLocked = true;
-            slot.isFixed = true;
-            if (slot.isReleasing)
-            {
-                // Freeze at the depth reached, not mid-release.
-                slot.isReleasing = false;
-                slot.targetGainDb = juce::jmin(slot.targetGainDb, slot.currentGainDb);
-            }
-            publish(i);
+            slots[i].isLocked = true;
+            slots[i].isFixed = true;
         }
     }
 }
@@ -394,25 +391,22 @@ void FilterManager::clearAll()
 {
     std::lock_guard<std::mutex> lock(filterMutex);
     for (int i = 0; i < TOTAL_FILTERS; ++i)
-        if (slots[static_cast<size_t>(i)].id != -1)
-            freeSlot(i);
+    {
+        slots[i].id = -1;
+        ctlSetBypass(i, true); // V2.1: fade out at its own frequency instead of an instant jump
+    }
 }
 
-void FilterManager::setFilterLocked(int id, bool lockState)
+void FilterManager::setFilterLocked(int id, bool lock)
 {
     std::lock_guard<std::mutex> lockGuard(filterMutex);
     for (int i = 0; i < TOTAL_FILTERS; ++i)
     {
-        auto& slot = slots[static_cast<size_t>(i)];
-        if (slot.id == id)
+        if (slots[i].id == id)
         {
-            slot.isLocked = lockState;
-            if (lockState)
-            {
-                slot.isFixed = true;
-                slot.isReleasing = false;
-            }
-            publish(i);
+            slots[i].isLocked = lock;
+            if (lock)
+                slots[i].isFixed = true;
             break;
         }
     }
@@ -423,10 +417,10 @@ void FilterManager::setFilterBypassed(int id, bool bypass)
     std::lock_guard<std::mutex> lock(filterMutex);
     for (int i = 0; i < TOTAL_FILTERS; ++i)
     {
-        if (slots[static_cast<size_t>(i)].id == id)
+        if (slots[i].id == id)
         {
-            slots[static_cast<size_t>(i)].isBypassed = bypass;
-            publish(i);
+            slots[i].isBypassed = bypass;
+            ctlSetBypass(i, bypass);
             break;
         }
     }
@@ -437,9 +431,10 @@ void FilterManager::deleteFilter(int id)
     std::lock_guard<std::mutex> lock(filterMutex);
     for (int i = 0; i < TOTAL_FILTERS; ++i)
     {
-        if (slots[static_cast<size_t>(i)].id == id)
+        if (slots[i].id == id)
         {
-            freeSlot(i);
+            slots[i].id = -1;
+            ctlSetBypass(i, true); // V2.1: fade out at its own frequency instead of an instant jump
             break;
         }
     }
@@ -455,26 +450,29 @@ int FilterManager::addFilter(float freqHz, float gainDb, float q, bool isFixed, 
     if (! std::isfinite(freqHz) || ! std::isfinite(gainDb) || ! std::isfinite(q))
         return -1;
     std::lock_guard<std::mutex> lock(filterMutex);
-    const int slotIdx = isFixed ? allocateFixedSlot() : allocateLiveSlot();
+    int slotIdx = isFixed ? allocateFixedSlot() : allocateLiveSlot();
     if (slotIdx < 0)
         return -1;
 
-    auto& slot = slots[static_cast<size_t>(slotIdx)];
+    auto& slot = slots[slotIdx];
     slot.id = nextId++;
-    slot.isFixed = isFixed || locked;
+    slot.isFixed = isFixed;
     slot.isLocked = locked;
+    if (locked) slot.isFixed = true;
     slot.isBypassed = bypassed;
-    slot.isReleasing = false;
-    slot.frequency = juce::jlimit(20.0f, static_cast<float>(sampleRate * 0.49), freqHz);
-    slot.q = juce::jlimit(1.0f, 150.0f, q);
-    slot.targetGainDb = juce::jlimit(-60.0f, 0.0f, gainDb);
-    slot.currentGainDb = 0.0f;
+    slot.frequency = freqHz;
+    slot.q = q;
+    slot.targetGainDb = gainDb;
+    slot.currentGainDb = gainDb;
     slot.liftRemainingSec = liftDurationSec;
     slot.liftDurationSec = liftDurationSec;
     slot.triggerCount = 1;
     slot.deepenCooldownSec = 0.15f;
     slot.activity = 1.0f;
-    publish(slotIdx);
+
+    shadow[static_cast<size_t>(slotIdx)].bypass = bypassed;
+    ctlSetParameters(slotIdx, freqHz, gainDb, q, true);
+    sharedCurrentGainDb[static_cast<size_t>(slotIdx)].store(bypassed ? 0.0f : juce::jlimit(-60.0f, 0.0f, gainDb), std::memory_order_relaxed);
     return slot.id;
 }
 
@@ -490,12 +488,12 @@ void FilterManager::getFilterSnapshots(std::vector<FilterSlotInfo>& result)
 {
     result.clear();
     std::lock_guard<std::mutex> lock(filterMutex);
+
     for (int i = 0; i < TOTAL_FILTERS; ++i)
     {
-        const auto& slot = slots[static_cast<size_t>(i)];
-        if (slot.id != -1)
+        if (slots[i].id != -1)
         {
-            FilterSlotInfo info = slot;
+            FilterSlotInfo info = slots[i];
             info.currentGainDb = sharedCurrentGainDb[static_cast<size_t>(i)].load(std::memory_order_relaxed);
             result.push_back(info);
         }
@@ -506,12 +504,18 @@ float FilterManager::getCombinedMagnitude(float freqHz)
 {
     std::lock_guard<std::mutex> lock(filterMutex);
     float totalMag = 1.0f;
+
     for (int i = 0; i < TOTAL_FILTERS; ++i)
     {
-        const auto& slot = slots[static_cast<size_t>(i)];
-        const float g = sharedCurrentGainDb[static_cast<size_t>(i)].load(std::memory_order_relaxed);
-        if (std::abs(g) > 0.01f)
-            totalMag *= BiquadNotchFilter::magnitudeAt(sampleRate, slot.frequency, g, slot.q, freqHz);
+        if (slots[i].id != -1 && !slots[i].isBypassed)
+        {
+        {
+            BiquadNotchFilter f; // UI-side model of the current response (no access to audio-thread state)
+            f.prepare(sampleRate);
+            f.setParameters(slots[i].frequency, sharedCurrentGainDb[static_cast<size_t>(i)].load(std::memory_order_relaxed), slots[i].q, true);
+            totalMag *= f.getMagnitudeForFrequency(freqHz);
+        }
+        }
     }
     return totalMag;
 }

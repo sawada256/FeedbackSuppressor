@@ -5,18 +5,15 @@
 #include "dsp/FeedbackDetector.h"
 #include "dsp/FilterManager.h"
 #include "dsp/PanicLimiter.h"
+#include "dsp/LookaheadDelay.h"
 
 namespace LiveAudioLab
 {
 
 /**
- * V3 threading model
- *  - Audio thread (processBlock): notch cascade, analysis FIFO push, limiter.
- *    No locks, no allocation, no host callbacks.
- *  - Analysis worker thread (run): STFT detection, notch bookkeeping, lift
- *    timers (advanced by the number of samples actually processed) and all
- *    parameter changes that touch the filter bank.
- *  - Message thread: UI, state save/restore, latency reporting (AsyncUpdater).
+ * V2.1 threading: the audio thread only touches lock-free state; detection,
+ * notch bookkeeping, lift timers and filter-bank parameter changes run on the
+ * analysis worker; latency changes are reported from the message thread.
  */
 class FeedbackSuppressorAudioProcessor : public juce::AudioProcessor,
                                          public juce::Thread,
@@ -53,21 +50,20 @@ public:
     void getStateInformation(juce::MemoryBlock& destData) override;
     void setStateInformation(const void* data, int sizeInBytes) override;
 
+    // Component accessors for Editor
     FilterManager& getFilterManager() noexcept { return filterManager; }
     FeedbackDetector& getFeedbackDetector() noexcept { return detector; }
     PanicLimiter& getPanicLimiter() noexcept { return panicLimiter; }
     juce::AudioProcessorValueTreeState& getAPVTS() noexcept { return apvts; }
 
-    // Worker thread for the sidechain STFT analysis.
+    // Thread function for sidechain STFT analysis
     void run() override;
-
-    static constexpr float LOOKAHEAD_MS = 3.0f;
 
 private:
     static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
     void applyControlParameters();      // worker / message thread only
-    int lookaheadSamplesFor(int latencyModeIndex) const noexcept;
-    void handleAsyncUpdate() override;  // reports latency changes on the message thread
+    int targetLatencySamples() const noexcept;
+    void handleAsyncUpdate() override;
     void startAnalysis();
     void stopAnalysis();
 
@@ -76,14 +72,13 @@ private:
     FeedbackDetector detector;
     FilterManager filterManager;
     PanicLimiter panicLimiter;
+    LookaheadDelay lookaheadDelay;
 
     juce::WaitableEvent analysisEvent;
     std::atomic<bool> shouldExitThread { false };
     std::atomic<int64_t> samplesProcessed { 0 };
-    int64_t samplesAccounted = 0; // worker thread
+    int64_t samplesAccounted = 0;              // worker thread
     std::atomic<int> reportedLatency { 0 };
-
-    // Cached raw parameter pointers (read on the audio thread).
     std::atomic<float>* opModeParam = nullptr;
     std::atomic<float>* latencyModeParam = nullptr;
     std::atomic<float>* panicParam = nullptr;

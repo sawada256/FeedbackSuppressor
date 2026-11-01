@@ -22,7 +22,7 @@ SpectrumVisualizer::~SpectrumVisualizer()
 void SpectrumVisualizer::timerCallback()
 {
     detector.copySpectrumTo(spectrumMags, baselineMags);
-    filterManager.getFilterSnapshots(filterSnapshots);
+    filterSnapshots = filterManager.getFilterSnapshots();
 
     // Smooth spectrum animation
     for (size_t i = 0; i < spectrumMags.size(); ++i)
@@ -280,8 +280,7 @@ void SpectrumVisualizer::updateEqPath()
 
     std::vector<ActiveFilterParams> activeFilters;
     activeFilters.reserve(filterSnapshots.size());
-    // The notch filters run at the host rate (the detector may analyse a decimated signal).
-    const double sr = filterManager.getSampleRate();
+    const double sr = detector.getSampleRate();
 
     for (const auto& slot : filterSnapshots)
     {

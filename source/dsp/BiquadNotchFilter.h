@@ -8,177 +8,233 @@ namespace LiveAudioLab
 {
 
 /**
- * Zero-latency RBJ peaking-cut biquad (TDF-II, double precision state).
+ * High-precision parametric IIR Biquad Notch / Peaking Filter
+ * Provides 0-sample algorithmic latency using direct form II transposed structure.
+ * Includes smooth parameter interpolation to prevent zipper noise and clicks.
  *
- * V3 changes:
- *  - Coefficients are recomputed once per 16-sample sub-block while parameters
- *    glide (V2 recomputed cos/sin/pow on every sample).
- *  - Gain glides in dB, frequency and Q glide in the log domain (~10 ms time
- *    constant, independent of sample rate and block size).
- *  - A filter whose gain is ~0 dB is idle: it costs nothing and its state is
- *    cleared, so a newly assigned notch starts at its own frequency instead of
- *    sweeping across the spectrum from a stale one.
- *  - Double-precision coefficients/state keep narrow low-frequency notches
- *    (pole radius ~ 1 - 1e-4) numerically stable.
- * Owned by the audio thread only; the control side passes targets through
- * FilterManager's lock-free mailbox.
+ * V2.1 (behaviour-preserving changes only):
+ *  - Same per-sample parameter glide and the same float arithmetic as V2, so the
+ *    notch response is bit-identical while active.
+ *  - When no glide is in progress, each channel runs in a tight loop without
+ *    re-checking the smoothing condition per sample (same results, less CPU).
+ *  - Bypass no longer drops the filter from the signal path instantly: the gain
+ *    glides to 0 dB with the normal ~10 ms smoothing and only then stops (no click).
+ *  - A filter whose gain is ~0 dB starts a new notch directly at its own
+ *    frequency/Q instead of sweeping from the previous one (V2 swept from 1 kHz).
+ *  - Non-finite state (NaN/Inf input) is reset instead of silencing the channel.
  */
 class BiquadNotchFilter
 {
 public:
-    static constexpr int SUB_BLOCK = 16;
-
     BiquadNotchFilter() = default;
 
     void prepare(double newSampleRate)
     {
         sampleRate = newSampleRate > 0.0 ? newSampleRate : 44100.0;
-        stepCoeff = 1.0 - std::exp(-static_cast<double>(SUB_BLOCK) / (0.010 * sampleRate));
+        smoothingFactor = static_cast<float>(1.0 - std::exp(-1.0 / (0.01 * sampleRate)));
         reset();
+        updateCoefficients(true);
     }
 
     void reset()
     {
-        clearState();
-        currentGainDb = targetGainDb;
-        currentLogFreq = targetLogFreq;
-        currentLogQ = targetLogQ;
-        updateCoefficients();
+        s1[0] = s2[0] = 0.0f;
+        s1[1] = s2[1] = 0.0f;
+        currentGainDb = effectiveTargetGain();
+        currentFreq = targetFreq;
+        currentQ = targetQ;
     }
 
-    void setTarget(float freqHz, float gainDb, float q) noexcept
+    void setParameters(float freqHz, float gainDb, float q, bool immediate = false)
     {
-        const double f = juce::jlimit(20.0, sampleRate * 0.49, std::isfinite(freqHz) ? static_cast<double>(freqHz) : 1000.0);
-        targetLogFreq = std::log(f);
-        targetGainDb = juce::jlimit(-60.0, 0.0, std::isfinite(gainDb) ? static_cast<double>(gainDb) : 0.0);
-        targetLogQ = std::log(juce::jlimit(0.5, 150.0, std::isfinite(q) ? static_cast<double>(q) : 35.0));
-    }
+        targetFreq = juce::jlimit(20.0f, static_cast<float>(sampleRate * 0.49), freqHz);
+        targetGainDb = juce::jlimit(-60.0f, 0.0f, gainDb);
+        targetQ = juce::jlimit(1.0f, 150.0f, q);
 
-    /** Jump to the current targets (state restore / tests), never used mid-signal for an active notch. */
-    void snapToTarget() noexcept
-    {
-        currentGainDb = targetGainDb;
-        currentLogFreq = targetLogFreq;
-        currentLogQ = targetLogQ;
-        updateCoefficients();
-    }
-
-    bool isIdle() const noexcept { return std::abs(currentGainDb) < idleDb && std::abs(targetGainDb) < idleDb; }
-
-    float getCurrentGainDb() const noexcept { return static_cast<float>(currentGainDb); }
-    float getTargetGainDb() const noexcept { return static_cast<float>(targetGainDb); }
-    float getCurrentFrequency() const noexcept { return static_cast<float>(std::exp(currentLogFreq)); }
-
-    void process(float* const* channels, int numChannels, int numSamples) noexcept
-    {
-        numChannels = juce::jmin(2, numChannels);
-        if (isIdle())
+        if (immediate)
         {
-            if (! stateCleared) clearState();
-            currentGainDb = 0.0;
+            currentFreq = targetFreq;
+            currentGainDb = effectiveTargetGain();
+            currentQ = targetQ;
+            updateCoefficients(true);
+        }
+    }
+
+    /** Bypass glides the gain to 0 dB (click-free) and then stops processing. */
+    void setBypass(bool shouldBypass) { bypassed = shouldBypass; }
+    bool isBypassed() const noexcept { return bypassed; }
+
+    float getTargetFrequency() const noexcept { return targetFreq; }
+    float getCurrentGainDb() const noexcept { return currentGainDb; }
+    float getTargetGainDb() const noexcept { return targetGainDb; }
+    float getTargetQ() const noexcept { return targetQ; }
+
+    void process(juce::AudioBuffer<float>& buffer)
+    {
+        process(buffer.getArrayOfWritePointers(), buffer.getNumChannels(), buffer.getNumSamples());
+    }
+
+    /**
+     * Process a stereo or mono sample block.
+     * Algorithmic latency is strictly 0 samples.
+     */
+    void process(float* const* channels, int numChannelsIn, int numSamples) noexcept
+    {
+        const float gainTarget = effectiveTargetGain();
+        if (bypassed && std::abs(currentGainDb) < 0.05f)
+        {
+            if (! stateCleared)
+            {
+                // Fully faded out: settle at 0 dB and drop the decayed state.
+                currentGainDb = 0.0f;
+                s1[0] = s2[0] = s1[1] = s2[1] = 0.0f;
+                stateCleared = true;
+            }
             return;
         }
 
-        // A notch rising from 0 dB starts directly at its own frequency/Q.
-        if (std::abs(currentGainDb) < idleDb)
+        // A notch rising from ~0 dB goes straight to its own frequency/Q
+        // (V2 glided across the spectrum from the previous/placeholder frequency).
+        if (std::abs(currentGainDb) < 0.05f && std::abs(gainTarget) >= 0.05f
+            && (currentFreq != targetFreq || currentQ != targetQ))
         {
-            currentLogFreq = targetLogFreq;
-            currentLogQ = targetLogQ;
-            clearState();
-            updateCoefficients();
+            currentFreq = targetFreq;
+            currentQ = targetQ;
+            updateCoefficients(false);
         }
         stateCleared = false;
 
-        for (int start = 0; start < numSamples; start += SUB_BLOCK)
+        const int numChannels = juce::jmin(2, numChannelsIn);
+        const float smoothFactor = smoothingFactor;
+
+        int i = 0;
+        while (i < numSamples)
         {
-            if (std::abs(currentGainDb - targetGainDb) > 1.0e-3
-                || std::abs(currentLogFreq - targetLogFreq) > 1.0e-5
-                || std::abs(currentLogQ - targetLogQ) > 1.0e-4)
+            if (needsSmoothing(gainTarget))
             {
-                currentGainDb += stepCoeff * (targetGainDb - currentGainDb);
-                currentLogFreq += stepCoeff * (targetLogFreq - currentLogFreq);
-                currentLogQ += stepCoeff * (targetLogQ - currentLogQ);
-                if (std::abs(currentGainDb - targetGainDb) < 0.01) currentGainDb = targetGainDb;
-                updateCoefficients();
+                // Identical to V2: smooth, recompute, then filter this sample.
+                currentGainDb += smoothFactor * (gainTarget - currentGainDb);
+                currentFreq += smoothFactor * (targetFreq - currentFreq);
+                currentQ += smoothFactor * (targetQ - currentQ);
+                updateCoefficients(false);
+                for (int ch = 0; ch < numChannels; ++ch)
+                {
+                    float* channelData = channels[ch];
+                    const float in = channelData[i];
+                    const float out = b0 * in + s1[ch];
+                    s1[ch] = b1 * in - a1 * out + s2[ch];
+                    s2[ch] = b2 * in - a2 * out;
+                    channelData[i] = out;
+                }
+                ++i;
+                continue;
             }
 
-            const int end = juce::jmin(numSamples, start + SUB_BLOCK);
+            // Steady state: coefficients are fixed for the rest of the block.
             for (int ch = 0; ch < numChannels; ++ch)
             {
-                float* data = channels[ch];
-                double z1 = s1[ch], z2 = s2[ch];
-                for (int i = start; i < end; ++i)
+                float* channelData = channels[ch];
+                float z1 = s1[ch], z2 = s2[ch];
+                for (int j = i; j < numSamples; ++j)
                 {
-                    const double in = data[i];
-                    const double out = b0 * in + z1;
+                    const float in = channelData[j];
+                    const float out = b0 * in + z1;
                     z1 = b1 * in - a1 * out + z2;
                     z2 = b2 * in - a2 * out;
-                    data[i] = static_cast<float>(out);
+                    channelData[j] = out;
                 }
-                s1[ch] = z1; s2[ch] = z2;
+                s1[ch] = z1;
+                s2[ch] = z2;
             }
+            break;
         }
 
-        // Recover from non-finite state (e.g. NaN injected upstream) instead of
-        // staying silent forever.
         for (int ch = 0; ch < 2; ++ch)
-            if (! std::isfinite(s1[ch]) || ! std::isfinite(s2[ch])) { s1[ch] = 0.0; s2[ch] = 0.0; }
+            if (! std::isfinite(s1[ch]) || ! std::isfinite(s2[ch]))
+                s1[ch] = s2[ch] = 0.0f;
     }
 
-    /** Linear magnitude of an RBJ peaking filter, for UI curves. */
-    static float magnitudeAt(double sampleRate, float centreHz, float gainDb, float q, float atHz) noexcept
+    /**
+     * Calculate magnitude response at a given frequency for UI curve display
+     */
+    float getMagnitudeForFrequency(float freqHz) const
     {
-        if (std::abs(gainDb) < 0.01f) return 1.0f;
-        double c[5];
-        computeCoefficients(sampleRate, centreHz, gainDb, q, c);
-        const double w = juce::MathConstants<double>::twoPi * atHz / sampleRate;
-        const std::complex<double> z1 = std::polar(1.0, -w), z2 = std::polar(1.0, -2.0 * w);
-        const auto num = c[0] + c[1] * z1 + c[2] * z2;
-        const auto den = 1.0 + c[3] * z1 + c[4] * z2;
+        if (std::abs(currentGainDb) < 0.01f)
+            return 1.0f;
+
+        const double w = 2.0 * juce::MathConstants<double>::pi * static_cast<double>(freqHz) / sampleRate;
+        const std::complex<double> z1 = std::polar(1.0, -w);
+        const std::complex<double> z2 = std::polar(1.0, -2.0 * w);
+
+        const std::complex<double> num = static_cast<double>(b0) + static_cast<double>(b1) * z1 + static_cast<double>(b2) * z2;
+        const std::complex<double> den = 1.0 + static_cast<double>(a1) * z1 + static_cast<double>(a2) * z2;
+
         return static_cast<float>(std::abs(num / den));
     }
 
 private:
-    static constexpr double idleDb = 0.02;
+    float effectiveTargetGain() const noexcept { return bypassed ? 0.0f : targetGainDb; }
 
-    static void computeCoefficients(double sr, double freq, double gainDb, double q, double* c) noexcept
+    bool needsSmoothing(float gainTarget) const noexcept
     {
-        const double w0 = juce::MathConstants<double>::twoPi * freq / sr;
-        const double cosW0 = std::cos(w0), sinW0 = std::sin(w0);
-        const double A = std::pow(10.0, gainDb / 40.0);
-        const double alpha = sinW0 / (2.0 * q);
-        const double invA0 = 1.0 / (1.0 + alpha / A);
-        c[0] = (1.0 + alpha * A) * invA0;
-        c[1] = -2.0 * cosW0 * invA0;
-        c[2] = (1.0 - alpha * A) * invA0;
-        c[3] = c[1];
-        c[4] = (1.0 - alpha / A) * invA0;
+        return std::abs(currentGainDb - gainTarget) > 0.01f
+            || std::abs(currentFreq - targetFreq) > 0.5f
+            || std::abs(currentQ - targetQ) > 0.1f;
     }
 
-    void updateCoefficients() noexcept
+    void updateCoefficients(bool force)
     {
-        double c[5];
-        computeCoefficients(sampleRate, std::exp(currentLogFreq), currentGainDb, std::exp(currentLogQ), c);
-        b0 = c[0]; b1 = c[1]; b2 = c[2]; a1 = c[3]; a2 = c[4];
-    }
+        if (!force && std::abs(currentGainDb) < 0.001f)
+        {
+            b0 = 1.0f; b1 = 0.0f; b2 = 0.0f;
+            a1 = 0.0f; a2 = 0.0f;
+            return;
+        }
 
-    void clearState() noexcept
-    {
-        s1[0] = s1[1] = s2[0] = s2[1] = 0.0;
-        stateCleared = true;
+        // Robert Bristow-Johnson (RBJ) Peaking EQ / Notch Formula
+        const double w0 = 2.0 * juce::MathConstants<double>::pi * static_cast<double>(currentFreq) / sampleRate;
+        const double cosW0 = std::cos(w0);
+        const double sinW0 = std::sin(w0);
+        const double A = std::pow(10.0, static_cast<double>(currentGainDb) / 40.0);
+        const double alpha = sinW0 / (2.0 * static_cast<double>(currentQ));
+
+        const double b0_un = 1.0 + alpha * A;
+        const double b1_un = -2.0 * cosW0;
+        const double b2_un = 1.0 - alpha * A;
+        const double a0_un = 1.0 + alpha / A;
+        const double a1_un = -2.0 * cosW0;
+        const double a2_un = 1.0 - alpha / A;
+
+        const double invA0 = 1.0 / a0_un;
+
+        b0 = static_cast<float>(b0_un * invA0);
+        b1 = static_cast<float>(b1_un * invA0);
+        b2 = static_cast<float>(b2_un * invA0);
+        a1 = static_cast<float>(a1_un * invA0);
+        a2 = static_cast<float>(a2_un * invA0);
     }
 
     double sampleRate = 44100.0;
-    double stepCoeff = 0.03;
-
-    double targetLogFreq = std::log(1000.0), currentLogFreq = std::log(1000.0);
-    double targetGainDb = 0.0, currentGainDb = 0.0;
-    double targetLogQ = std::log(35.0), currentLogQ = std::log(35.0);
-
-    double b0 = 1.0, b1 = 0.0, b2 = 0.0, a1 = 0.0, a2 = 0.0;
-    double s1[2] = { 0.0, 0.0 };
-    double s2[2] = { 0.0, 0.0 };
+    float smoothingFactor = 0.002265f;
+    bool bypassed = false;
     bool stateCleared = true;
+
+    float targetFreq = 1000.0f;
+    float currentFreq = 1000.0f;
+
+    float targetGainDb = 0.0f;
+    float currentGainDb = 0.0f;
+
+    float targetQ = 35.0f;
+    float currentQ = 35.0f;
+
+    // Filter coefficients
+    float b0 = 1.0f, b1 = 0.0f, b2 = 0.0f;
+    float a1 = 0.0f, a2 = 0.0f;
+
+    // State variables per channel (stereo)
+    float s1[2] = { 0.0f, 0.0f };
+    float s2[2] = { 0.0f, 0.0f };
 };
 
 } // namespace LiveAudioLab

@@ -45,19 +45,19 @@ juce::AudioProcessorValueTreeState::ParameterLayout FeedbackSuppressorAudioProce
         juce::ParameterID { "opMode", 1 }, "Operation Mode",
         juce::StringArray { "Live Auto", "Learn (Soundcheck)", "Bypass" }, 0));
 
-    // Latency Mode: 0 ms, or a 3 ms lookahead for the panic limiter
+    // Latency Mode (Zero Latency 0ms, Lookahead 3ms)
     params.push_back(std::make_unique<juce::AudioParameterChoice>(
         juce::ParameterID { "latencyMode", 1 }, "Latency Mode",
-        juce::StringArray { "Zero Latency (0 ms)", "Lookahead Limiter (3 ms)" }, 0));
+        juce::StringArray { "Zero Latency (0ms)", "Lookahead (3ms)" }, 0));
 
     // Panic Limiter (On / Off)
     params.push_back(std::make_unique<juce::AudioParameterBool>(
         juce::ParameterID { "panicLimiter", 1 }, "Panic Limiter", true));
 
-    // Detection Mode. Index 0 keeps the legacy detector ("Classic").
+    // Detection Mode (legacy, music-aware, sensitive music-aware)
     params.push_back(std::make_unique<juce::AudioParameterChoice>(
         juce::ParameterID { "detectionMode", 1 }, "Detection Mode",
-        juce::StringArray { "Classic (Legacy)", "Advanced (Music Aware)", "Aggressive (Fast)" }, 1));
+        juce::StringArray { "Standard (Safe)", "Advanced (Music Aware)", "Aggressive (Mix Hunter)" }, 1));
 
     return { params.begin(), params.end() };
 }
@@ -72,8 +72,8 @@ FeedbackSuppressorAudioProcessor::FeedbackSuppressorAudioProcessor()
     opModeParam = apvts.getRawParameterValue("opMode");
     latencyModeParam = apvts.getRawParameterValue("latencyMode");
     panicParam = apvts.getRawParameterValue("panicLimiter");
-    detectedList.reserve(64);
-    // Analysis starts in prepareToPlay, once sample rate and buffers are known.
+    detectedList.reserve(16);
+    // V2.1: the analysis thread starts in prepareToPlay (V2 started it here too).
 }
 
 FeedbackSuppressorAudioProcessor::~FeedbackSuppressorAudioProcessor()
@@ -95,28 +95,28 @@ void FeedbackSuppressorAudioProcessor::stopAnalysis()
     stopThread(-1);
 }
 
-int FeedbackSuppressorAudioProcessor::lookaheadSamplesFor(int latencyModeIndex) const noexcept
+int FeedbackSuppressorAudioProcessor::targetLatencySamples() const noexcept
 {
-    return latencyModeIndex == 1
-        ? static_cast<int>(std::round(LOOKAHEAD_MS * 0.001 * currentSampleRate.load()))
-        : 0;
+    const int latIdx = static_cast<int>(latencyModeParam->load());
+    return latIdx == 1 ? static_cast<int>(std::round(0.003 * currentSampleRate.load())) : 0;
 }
 
-void FeedbackSuppressorAudioProcessor::prepareToPlay(double sampleRate, int)
+void FeedbackSuppressorAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
 {
+    juce::ignoreUnused(samplesPerBlock);
     stopAnalysis();
     currentSampleRate.store(sampleRate > 0.0 ? sampleRate : 44100.0);
 
     detector.prepare(sampleRate);
     filterManager.prepare(sampleRate);
-    panicLimiter.prepare(sampleRate, static_cast<int>(std::ceil(0.010 * sampleRate))); // 10 ms capacity
+    panicLimiter.prepare(sampleRate);
+    lookaheadDelay.prepare(sampleRate, static_cast<int>(sampleRate * 0.05)); // 50ms buffer
 
     applyControlParameters();
-    const int lookahead = lookaheadSamplesFor(static_cast<int>(latencyModeParam->load()));
-    panicLimiter.setLookaheadSamples(lookahead);
-    panicLimiter.reset(); // start at the requested delay without a fade
-    setLatencySamples(lookahead);
-    reportedLatency.store(lookahead);
+    lookaheadDelay.setLookaheadMs(static_cast<int>(latencyModeParam->load()) == 1 ? 3.0f : 0.0f);
+    const int latency = targetLatencySamples();
+    setLatencySamples(latency);
+    reportedLatency.store(latency);
 
     samplesProcessed.store(0);
     samplesAccounted = 0;
@@ -129,6 +129,7 @@ void FeedbackSuppressorAudioProcessor::releaseResources()
     detector.reset();
     filterManager.reset();
     panicLimiter.reset();
+    lookaheadDelay.reset();
 }
 
 bool FeedbackSuppressorAudioProcessor::isBusesLayoutSupported(const BusesLayout& layouts) const
@@ -137,25 +138,40 @@ bool FeedbackSuppressorAudioProcessor::isBusesLayoutSupported(const BusesLayout&
      && layouts.getMainOutputChannelSet() != juce::AudioChannelSet::stereo())
         return false;
 
-    return layouts.getMainOutputChannelSet() == layouts.getMainInputChannelSet();
+    if (layouts.getMainOutputChannelSet() != layouts.getMainInputChannelSet())
+        return false;
+
+    return true;
 }
 
 void FeedbackSuppressorAudioProcessor::applyControlParameters()
 {
-    // Never called on the audio thread: these setters take the filter mutex.
+    // Same parameter mapping as V2's updateParameters(), but never called on the
+    // audio thread (these setters take the filter-bank mutex).
     detector.setSensitivity(apvts.getRawParameterValue("sensitivity")->load());
     detector.setGrowthSensitivity(static_cast<int>(apvts.getRawParameterValue("growthRateSens")->load()));
-    detector.setProfile(static_cast<DetectionProfile>(juce::jlimit(0, 4, static_cast<int>(apvts.getRawParameterValue("profile")->load()))));
-    detector.setDetectionMode(static_cast<DetectionMode>(juce::jlimit(0, 2, static_cast<int>(apvts.getRawParameterValue("detectionMode")->load()))));
+    detector.setProfile(static_cast<DetectionProfile>(static_cast<int>(apvts.getRawParameterValue("profile")->load())));
+    if (auto* detModeVal = apvts.getRawParameterValue("detectionMode"))
+        detector.setDetectionMode(static_cast<DetectionMode>(static_cast<int>(detModeVal->load())));
 
     filterManager.setDefaultQ(apvts.getRawParameterValue("notchQ")->load());
     filterManager.setMaxCutDepth(apvts.getRawParameterValue("maxCut")->load());
 
-    static constexpr float liftChoices[] = { 5.0f, 15.0f, 30.0f, 60.0f, 300.0f, -1.0f };
-    const int liftIdx = juce::jlimit(0, 5, static_cast<int>(apvts.getRawParameterValue("liftTime")->load()));
-    filterManager.setLiftDuration(liftChoices[liftIdx]);
+    const int liftIdx = static_cast<int>(apvts.getRawParameterValue("liftTime")->load());
+    float liftSeconds = 30.0f;
+    switch (liftIdx)
+    {
+        case 0: liftSeconds = 5.0f; break;
+        case 1: liftSeconds = 15.0f; break;
+        case 2: liftSeconds = 30.0f; break;
+        case 3: liftSeconds = 60.0f; break;
+        case 4: liftSeconds = 300.0f; break;
+        case 5: liftSeconds = -1.0f; break; // Hold / Infinite
+        default: liftSeconds = 30.0f; break;
+    }
+    filterManager.setLiftDuration(liftSeconds);
 
-    filterManager.setOperationMode(static_cast<OperationMode>(juce::jlimit(0, 2, static_cast<int>(opModeParam->load()))));
+    filterManager.setOperationMode(static_cast<OperationMode>(static_cast<int>(opModeParam->load())));
     panicLimiter.setEnabled(panicParam->load() > 0.5f);
 }
 
@@ -163,65 +179,75 @@ void FeedbackSuppressorAudioProcessor::processBlock(juce::AudioBuffer<float>& bu
 {
     juce::ScopedNoDenormals noDenormals;
 
-    const int numChannels = juce::jmin(getTotalNumInputChannels(), buffer.getNumChannels());
+    const int numChannels = buffer.getNumChannels();
     const int numSamples = buffer.getNumSamples();
+
     if (numChannels == 0 || numSamples == 0)
         return;
 
-    // Only lock-free atomics are touched here.
-    filterManager.setOperationMode(static_cast<OperationMode>(juce::jlimit(0, 2, static_cast<int>(opModeParam->load()))));
+    // Lock-free parameter reads only (V2 called the mutex-taking setters here).
+    filterManager.setOperationMode(static_cast<OperationMode>(static_cast<int>(opModeParam->load())));
     panicLimiter.setEnabled(panicParam->load() > 0.5f);
-    // The worker thread notices the change and reports the latency via the
-    // message thread (V2 called setLatencySamples() from the audio thread).
-    panicLimiter.setLookaheadSamples(lookaheadSamplesFor(static_cast<int>(latencyModeParam->load())));
+    lookaheadDelay.setLookaheadMs(static_cast<int>(latencyModeParam->load()) == 1 ? 3.0f : 0.0f);
 
-    // 1. Notch cascade (zero latency).
+    // 2. Optional lookahead delay (0ms or 3ms)
+    lookaheadDelay.process(buffer);
+
+    // 3. Notch Filter Cascade (Direct Form II Transposed biquads: 0-sample latency)
     filterManager.processAudio(buffer);
 
-    // 2. Analyse the residual after the notches, so successful suppression stops
-    //    further deepening. This sidechain adds no audio-path buffering.
+    // Analyze residual after EQ so successful suppression stops further deepening.
+    // This sidechain introduces no audio-path buffering.
     detector.pushSamples(buffer.getArrayOfReadPointers(), numChannels, numSamples);
     samplesProcessed.fetch_add(numSamples, std::memory_order_relaxed);
     analysisEvent.signal();
 
-    // 3. Panic limiter (optionally with lookahead delay).
+    // 4. Panic Limiter (Hearing/speaker protection)
     panicLimiter.process(buffer);
+
+    // 5. Lift timers now advance on the analysis thread (by samples processed).
 }
 
 void FeedbackSuppressorAudioProcessor::processBlockBypassed(juce::AudioBuffer<float>& buffer, juce::MidiBuffer&)
 {
-    // Keep the reported latency when the host bypasses the plugin.
-    panicLimiter.processDelayOnly(buffer);
+    // V2.1: keep the reported latency while the host bypasses the plug-in.
+    lookaheadDelay.setLookaheadMs(static_cast<int>(latencyModeParam->load()) == 1 ? 3.0f : 0.0f);
+    lookaheadDelay.process(buffer);
 }
 
 void FeedbackSuppressorAudioProcessor::handleAsyncUpdate()
 {
-    const int lookahead = panicLimiter.getLookaheadSamples();
-    if (getLatencySamples() != lookahead)
-        setLatencySamples(lookahead);
+    const int latency = reportedLatency.load();
+    if (getLatencySamples() != latency)
+        setLatencySamples(latency);
 }
 
 void FeedbackSuppressorAudioProcessor::run()
 {
-    while (! shouldExitThread.load(std::memory_order_relaxed))
+    while (!shouldExitThread.load(std::memory_order_relaxed))
     {
         analysisEvent.wait(20);
+
         if (shouldExitThread.load(std::memory_order_relaxed))
             break;
 
         applyControlParameters();
-        if (panicLimiter.getLookaheadSamples() != reportedLatency.load())
+        const int latency = targetLatencySamples();
+        if (latency != reportedLatency.load())
         {
-            reportedLatency.store(panicLimiter.getLookaheadSamples());
-            triggerAsyncUpdate();
+            reportedLatency.store(latency);
+            triggerAsyncUpdate(); // V2 called setLatencySamples() on the audio thread
         }
 
         detectedList.clear();
-        if (detector.processNextFrames(detectedList) && ! detectedList.empty())
-            filterManager.handleDetections(detectedList);
+        if (detector.processNextFrames(detectedList))
+        {
+            if (!detectedList.empty())
+            {
+                filterManager.handleDetections(detectedList);
+            }
+        }
 
-        // Timers advance with the audio actually processed (also correct for
-        // offline rendering faster than real time).
         const int64_t processed = samplesProcessed.load(std::memory_order_relaxed);
         const int64_t delta = processed - samplesAccounted;
         if (delta > 0)
@@ -248,8 +274,15 @@ void FeedbackSuppressorAudioProcessor::setCurrentProgram(int index)
 
     if (auto* param = apvts.getParameter("profile"))
     {
-        static constexpr float profileForProgram[] = { 0.0f, 1.0f, 3.0f, 4.0f, 2.0f };
-        param->setValueNotifyingHost(param->convertTo0to1(profileForProgram[currentProgram.load()]));
+        switch (currentProgram.load())
+        {
+            case 0: param->setValueNotifyingHost(param->convertTo0to1(0.0f)); break; // Speech
+            case 1: param->setValueNotifyingHost(param->convertTo0to1(1.0f)); break; // Music
+            case 2: param->setValueNotifyingHost(param->convertTo0to1(3.0f)); break; // High Focus
+            case 3: param->setValueNotifyingHost(param->convertTo0to1(4.0f)); break; // Low Focus
+            case 4: param->setValueNotifyingHost(param->convertTo0to1(2.0f)); break; // Flat (1/f)
+            default: break;
+        }
     }
 }
 
@@ -281,21 +314,21 @@ void FeedbackSuppressorAudioProcessor::getStateInformation(juce::MemoryBlock& de
     std::unique_ptr<juce::XmlElement> xml(state.createXml());
     if (xml == nullptr)
         return;
-    xml->setAttribute("pluginVersion", JucePlugin_VersionString);
 
-    // Persist Fixed & Locked filter slots for session/preset recall.
-    // Live (temporary) notches are intentionally not saved.
+    // Persist Fixed & Locked filter slots for session/preset recall
+    auto filtersSnapshot = filterManager.getFilterSnapshots();
     auto* filtersXml = xml->createNewChildElement("FixedFilters");
-    for (const auto& f : filterManager.getFilterSnapshots())
+    for (const auto& f : filtersSnapshot)
     {
-        if (! (f.isFixed || f.isLocked))
-            continue;
-        auto* slotXml = filtersXml->createNewChildElement("Filter");
-        slotXml->setAttribute("frequency", static_cast<double>(f.frequency));
-        slotXml->setAttribute("gainDb", static_cast<double>(f.targetGainDb));
-        slotXml->setAttribute("q", static_cast<double>(f.q));
-        slotXml->setAttribute("bypassed", f.isBypassed);
-        slotXml->setAttribute("locked", f.isLocked);
+        if (f.isFixed || f.isLocked)
+        {
+            auto* slotXml = filtersXml->createNewChildElement("Filter");
+            slotXml->setAttribute("frequency", static_cast<double>(f.frequency));
+            slotXml->setAttribute("gainDb", static_cast<double>(f.targetGainDb));
+            slotXml->setAttribute("q", static_cast<double>(f.q));
+            slotXml->setAttribute("bypassed", f.isBypassed);
+            slotXml->setAttribute("locked", f.isLocked);
+        }
     }
 
     copyXmlToBinary(*xml, destData);
@@ -307,7 +340,9 @@ void FeedbackSuppressorAudioProcessor::setStateInformation(const void* data, int
     if (xmlState == nullptr || ! xmlState->hasTagName(apvts.state.getType()))
         return;
 
-    // Separate the filter list from the parameter tree before replacing it.
+    // V2.1: detach the filter list before restoring the parameter tree (V2 left
+    // it inside the APVTS state), and always replace the fixed set so a preset
+    // without fixed filters clears stale ones.
     std::unique_ptr<juce::XmlElement> filtersXml;
     if (auto* f = xmlState->getChildByName("FixedFilters"))
     {
@@ -317,8 +352,6 @@ void FeedbackSuppressorAudioProcessor::setStateInformation(const void* data, int
     apvts.replaceState(juce::ValueTree::fromXml(*xmlState));
     applyControlParameters();
 
-    // Restore saved Fixed / Locked filters (always replace the current fixed set,
-    // so loading a preset without fixed filters clears stale ones).
     filterManager.clearAll();
     if (filtersXml != nullptr)
     {
@@ -331,6 +364,7 @@ void FeedbackSuppressorAudioProcessor::setStateInformation(const void* data, int
             const float q = static_cast<float>(slotXml->getDoubleAttribute("q", 35.0));
             const bool bypassed = slotXml->getBoolAttribute("bypassed", false);
             const bool locked = slotXml->getBoolAttribute("locked", true);
+            // V2 guessed the new id with getFilterSnapshots().back(); addFilter returns it.
             filterManager.addFilter(freq, gain, q, true, locked, bypassed);
         }
     }

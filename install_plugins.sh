@@ -1,42 +1,38 @@
 #!/bin/bash
-# Installs Feedback Suppressor V3 into the current user's plug-in folders.
-# Coexists with V2 (different plug-in code / bundle id).
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-NAME="Feedback Suppressor V3"
+RELEASE_DIR="${SCRIPT_DIR}/build-v21/FeedbackSuppressor_artefacts/Release"
 
-# Prefer the V3 build directory, fall back to ./build
-RELEASE_DIR=""
-for dir in "${SCRIPT_DIR}/build-v3" "${SCRIPT_DIR}/build"; do
-    if [ -d "${dir}/FeedbackSuppressor_artefacts/Release/VST3/${NAME}.vst3" ]; then
-        RELEASE_DIR="${dir}/FeedbackSuppressor_artefacts/Release"
-        break
-    fi
-done
-if [ -z "${RELEASE_DIR}" ]; then
-    echo "Build not found. Run: cmake -S . -B build-v3 -DCMAKE_BUILD_TYPE=Release && cmake --build build-v3"
-    exit 1
-fi
+echo "=== Installing Feedback Suppressor V2.1 Plugins ==="
 
-echo "=== Installing ${NAME} from ${RELEASE_DIR} ==="
-
-if [ -d "${RELEASE_DIR}/VST3/${NAME}.vst3" ]; then
-    mkdir -p ~/Library/Audio/Plug-Ins/VST3
-    rm -rf ~/Library/Audio/Plug-Ins/VST3/"${NAME}.vst3"
-    cp -R "${RELEASE_DIR}/VST3/${NAME}.vst3" ~/Library/Audio/Plug-Ins/VST3/
-    echo "  [OK] ~/Library/Audio/Plug-Ins/VST3/${NAME}.vst3"
-fi
-
-if [ -d "${RELEASE_DIR}/AU/${NAME}.component" ]; then
+# 1. Install Audio Unit (AU)
+if [ -d "${RELEASE_DIR}/AU/Feedback Suppressor V2.1.component" ]; then
+    echo "Installing AU component..."
     mkdir -p ~/Library/Audio/Plug-Ins/Components
-    rm -rf ~/Library/Audio/Plug-Ins/Components/"${NAME}.component"
-    cp -R "${RELEASE_DIR}/AU/${NAME}.component" ~/Library/Audio/Plug-Ins/Components/
-    echo "  [OK] ~/Library/Audio/Plug-Ins/Components/${NAME}.component"
+    rm -rf ~/Library/Audio/Plug-Ins/Components/"Feedback Suppressor V2.1.component"
+    cp -R "${RELEASE_DIR}/AU/Feedback Suppressor V2.1.component" ~/Library/Audio/Plug-Ins/Components/
+    echo "  [OK] Installed to ~/Library/Audio/Plug-Ins/Components/Feedback Suppressor V2.1.component"
 fi
 
-if [ -d "${RELEASE_DIR}/Standalone/${NAME}.app" ]; then
-    echo "Standalone application: ${RELEASE_DIR}/Standalone/${NAME}.app"
+# 2. Install VST3
+if [ -d "${RELEASE_DIR}/VST3/Feedback Suppressor V2.1.vst3" ]; then
+    echo "Installing VST3 plugin..."
+    if cp -R "${RELEASE_DIR}/VST3/Feedback Suppressor V2.1.vst3" ~/Library/Audio/Plug-Ins/VST3/ 2>/dev/null; then
+        echo "  [OK] Installed to ~/Library/Audio/Plug-Ins/VST3/Feedback Suppressor V2.1.vst3"
+    elif cp -R "${RELEASE_DIR}/VST3/Feedback Suppressor V2.1.vst3" /Library/Audio/Plug-Ins/VST3/ 2>/dev/null; then
+        echo "  [OK] Installed to /Library/Audio/Plug-Ins/VST3/Feedback Suppressor V2.1.vst3"
+    else
+        echo "  [INFO] Installing to VST3 folder requires permissions."
+        echo "  Run:"
+        echo "    sudo cp -R \"${RELEASE_DIR}/VST3/Feedback Suppressor V2.1.vst3\" /Library/Audio/Plug-Ins/VST3/"
+    fi
 fi
 
-echo "=== Done. Restart Cubase (or rescan in the VST Plug-in Manager). ==="
+# 3. Standalone App
+if [ -d "${RELEASE_DIR}/Standalone/Feedback Suppressor V2.1.app" ]; then
+    echo "Standalone Application:"
+    echo "  -> ${RELEASE_DIR}/Standalone/Feedback Suppressor V2.1.app"
+fi
+
+echo "=== Installation Completed Successfully! ==="

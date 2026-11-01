@@ -179,9 +179,7 @@ int main()
         require(!detector.processNextFrames(events), "FIFO overflow safely drops a block");
         detector.reset();
         juce::AudioBuffer<float> block(1, 256);
-        // V3: a constant (non-growing) tone needs the 700 ms steady-path hold, so
-        // the recovery check runs 1.5 s instead of 0.75 s.
-        for (int b = 0; b < 280; ++b)
+        for (int b = 0; b < 140; ++b)
         {
             for (int i = 0; i < 256; ++i)
                 block.setSample(0, i, 0.02f * static_cast<float>(std::sin(juce::MathConstants<double>::twoPi * 1943 * (b * 256 + i) / 48000)));
@@ -206,7 +204,7 @@ int main()
         std::mt19937 generator(51);
         std::uniform_real_distribution<float> noise(-0.008f, 0.008f);
         bool first = false, second = false;
-        for (int b = 0; b < 400; ++b) // steady tones: allow the V3 steady-path hold
+        for (int b = 0; b < 220; ++b)
         {
             for (int i = 0; i < 256; ++i)
             {

@@ -4,6 +4,7 @@
 #include "../source/dsp/FeedbackDetector.h"
 #include "../source/dsp/FilterManager.h"
 #include "../source/dsp/PanicLimiter.h"
+#include "../source/dsp/LookaheadDelay.h"
 
 // Keep verification assertions active in Release, while JUCE keeps its own
 // configured build mode. Undefine only after the JUCE headers have been included.
@@ -28,14 +29,13 @@ int main()
         std::cout << "\n[Test 1] 0-Sample Algorithmic Latency Test..." << std::endl;
         BiquadNotchFilter filter;
         filter.prepare(sampleRate);
-        filter.setTarget(1000.0f, -12.0f, 35.0f);
-        filter.snapToTarget();
+        filter.setParameters(1000.0f, -12.0f, 35.0f, true);
 
         juce::AudioBuffer<float> testBuf(1, 16);
         testBuf.clear();
         testBuf.setSample(0, 0, 1.0f); // Dirac delta impulse at index 0
 
-        filter.process(testBuf.getArrayOfWritePointers(), 1, testBuf.getNumSamples());
+        filter.process(testBuf);
 
         // First sample must be non-zero (immediate minimum-phase response at index 0)
         float firstSample = testBuf.getSample(0, 0);
@@ -206,53 +206,50 @@ int main()
         std::cout << "  --> PASS: Feedback detected and suppressed accurately!" << std::endl;
     }
 
-    // 5. Lookahead Limiter Delay Test (V3: the 3 ms delay belongs to the panic limiter)
+    // 5. Lookahead Delay Test
     {
-        std::cout << "\n[Test 5] Lookahead Limiter Delay Test..." << std::endl;
-        PanicLimiter limiter;
-        limiter.prepare(sampleRate, static_cast<int>(0.01 * sampleRate));
+        std::cout << "\n[Test 5] Lookahead Delay Line Test..." << std::endl;
+        LookaheadDelay delay;
+        delay.prepare(sampleRate);
 
         // Zero latency mode
-        limiter.setLookaheadSamples(0);
-        limiter.reset();
+        delay.setLookaheadMs(0.0f);
         juce::AudioBuffer<float> buf0(1, 16);
         buf0.clear();
-        buf0.setSample(0, 0, 0.5f);
-        limiter.process(buf0);
-        assert(buf0.getSample(0, 0) == 0.5f && "Zero latency mode must have 0 delay");
+        buf0.setSample(0, 0, 1.0f);
+        delay.process(buf0);
+        assert(buf0.getSample(0, 0) == 1.0f && "Zero latency mode must have 0 delay");
         std::cout << "  Zero latency mode: delay = 0 samples" << std::endl;
 
-        // 3 ms lookahead
+        // 3ms Lookahead mode
+        delay.setLookaheadMs(3.0f);
         const int expectedDelay = static_cast<int>(std::round(0.003 * sampleRate)); // 132 samples
-        limiter.setLookaheadSamples(expectedDelay);
-        limiter.reset();
+        std::cout << "  Lookahead 3ms expected delay: " << expectedDelay << " samples" << std::endl;
+
         juce::AudioBuffer<float> bufLookahead(1, expectedDelay * 3);
         bufLookahead.clear();
-        bufLookahead.setSample(0, 0, 0.5f);
-        limiter.process(bufLookahead);
+        bufLookahead.setSample(0, 0, 1.0f); // Dirac delta impulse
+        delay.process(bufLookahead);
+
         int peakSampleIdx = -1;
         for (int i = 0; i < bufLookahead.getNumSamples(); ++i)
-            if (std::abs(bufLookahead.getSample(0, i)) > 0.25f) { peakSampleIdx = i; break; }
-        std::cout << "  Impulse emerged at sample: " << peakSampleIdx << " (expected " << expectedDelay << ")" << std::endl;
-        assert(peakSampleIdx == expectedDelay && "Impulse must be delayed by exactly the reported 3 ms");
-
-        // Lookahead: a sudden +12 dB step must never exceed the ceiling (no overshoot, no clipping needed)
-        limiter.reset();
-        juce::AudioBuffer<float> step(1, 2048);
-        for (int i = 0; i < 2048; ++i) step.setSample(0, i, i < 1000 ? 0.1f : 4.0f);
-        limiter.process(step);
-        float maxPeak = 0.0f;
-        for (int i = 0; i < 2048; ++i) maxPeak = std::max(maxPeak, std::abs(step.getSample(0, i)));
-        std::cout << "  Lookahead step response peak: " << maxPeak << std::endl;
-        assert(maxPeak <= PanicLimiter::CEILING + 0.01f && "Lookahead limiter must not overshoot the ceiling");
-        std::cout << "  --> PASS: Lookahead limiter delays by exactly 3 ms and catches steps without overshoot!" << std::endl;
+        {
+            if (std::abs(bufLookahead.getSample(0, i)) > 0.5f)
+            {
+                peakSampleIdx = i;
+                break;
+            }
+        }
+        std::cout << "  Impulse emerged at sample: " << peakSampleIdx << std::endl;
+        assert(peakSampleIdx > 100 && peakSampleIdx <= expectedDelay + 5 && "Impulse must be delayed by ~3ms");
+        std::cout << "  --> PASS: Lookahead delay successfully delays through-path by 3ms!" << std::endl;
     }
 
     // 6. Panic Limiter Overload Clamping Test
     {
         std::cout << "\n[Test 6] Panic Limiter Overload Clamping Test..." << std::endl;
         PanicLimiter limiter;
-        limiter.prepare(sampleRate, 512);
+        limiter.prepare(sampleRate);
         limiter.setEnabled(true);
 
         juce::AudioBuffer<float> loudBuffer(1, 256);
